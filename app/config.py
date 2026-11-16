@@ -15,11 +15,13 @@ STATIC_DIR = ROOT / "static"
 
 # --- AI extraction -----------------------------------------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-# Tried in order; the first model the key can use wins.
+# Tried in order; the first model that answers wins. Free-tier daily quotas are counted
+# per model, so a wider pool means more invoices per day before the offline parser takes over.
+# The lite models come first: the full flash models allow only about 20 requests a day each.
 GEMINI_MODELS = [
     m.strip()
     for m in os.getenv(
-        "GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.8-flash"
+        "GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3-flash-preview,gemini-3.6-flash,gemini-3.8-flash"
     ).split(",")
     if m.strip()
 ]

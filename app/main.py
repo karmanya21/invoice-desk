@@ -34,7 +34,10 @@ SAMPLE_INFO = {
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "ai_enabled": bool(config.GEMINI_API_KEY), "models": config.GEMINI_MODELS}
+    import time
+    from . import extract
+    resting = [m for m in config.GEMINI_MODELS if extract._blocked.get(m, 0) > time.time()]   # over quota, skipped for now
+    return {"ok": True, "ai_enabled": bool(config.GEMINI_API_KEY), "models": config.GEMINI_MODELS, "resting": resting}
 
 
 @app.get("/api/samples")

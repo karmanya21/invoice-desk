@@ -162,7 +162,10 @@ function renderRun(run, el) {
   const why = run.stages?.find((x) => x.key === "extract")?.details.find((x) => x.label === "Why not the AI model")?.value;
   const degraded = run.extractor === "text-parser" && state.aiEnabled
     ? `<div class="strip"><b>The AI reader did not answer, so the offline parser read this invoice.</b> ${esc(why || "")} Digital PDFs still work; scanned invoices will be held until the reader is back.</div>` : "";
-  if (run.status !== "running") setPill(run.extractor);
+  if (run.status !== "running") {
+    setPill(run.extractor);
+    api("/api/health").then((h) => { state.resting = h.resting || []; if (run.extractor !== "text-parser") setPill(); }).catch(() => {});
+  }
   $(".run-main", shell).innerHTML = degraded + (run.status !== "running" ? decisionCard(run) : "") + `<h3 style="margin-top:0">What the process did</h3>` + timeline(run);
   if (vals.name && $("#rv-name", shell)) $("#rv-name", shell).value = vals.name;
   if (vals.note && $("#rv-note", shell)) $("#rv-note", shell).value = vals.note;
@@ -453,7 +456,7 @@ function setPill(lastReader) {
   } else {
     pill.textContent = "AI reader: Gemini";
     pill.className = "pill on";
-    pill.title = "Invoices are read by Gemini. Decisions are made by rules.";
+    pill.title = `Invoices are read by Gemini; decisions are made by rules. Reader pool: ${state.pool.length} models` + (state.resting.length ? `, ${state.resting.length} resting because their free daily quota is used up.` : ".");
   }
 }
 
@@ -494,6 +497,7 @@ $("#reset-btn").addEventListener("click", async () => {
   refreshBadge();
   const h = await api("/api/health").catch(() => null);
   state.aiEnabled = !!h?.ai_enabled;
-  state.model = h?.models?.[0];
+  state.pool = h?.models || [];
+  state.resting = h?.resting || [];
   setPill();
 })();
