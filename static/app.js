@@ -15,6 +15,7 @@ function waiting(run) {
   return { age: span(age), overdue: left <= 0, left: span(left) };
 }
 const touchedBy = (run) => (run.corrections || []).filter((e) => (e.kind || "correction") !== "recheck");
+const cap = (t) => String(t).charAt(0).toUpperCase() + String(t).slice(1);
 const OUTCOME = { APPROVED: "Approved", HOLD: "On hold", REJECTED: "Rejected" };
 const STAGE_NAMES = ["Receive document", "Read invoice", "Validate fields and arithmetic", "Verify vendor", "Check for duplicates", "Match purchase order", "3-way match: PO balance and goods received", "Decide and route"];
 const ICON = { ok: "✓", warn: "!", fail: "✕", skipped: "–", pending: "", running: "" };
@@ -161,7 +162,7 @@ function timeline(run) {
     return `<li class="stage ${s.status}">
       <div class="dot">${ICON[s.status] ?? ""}</div>
       <div class="stage-head" data-toggle="${s.key}" data-run="${run.id}" data-open="${open ? 1 : 0}">
-        <span class="stage-title">${s.seq}. ${esc(s.title)}</span>
+        <span class="stage-title">${s.seq}. ${esc(s.title)}</span>${s.details.length ? `<span class="caret" aria-hidden="true">›</span>` : ""}
         ${s.duration_ms != null ? `<span class="stage-ms">${s.duration_ms < 1000 ? s.duration_ms + " ms" : (s.duration_ms / 1000).toFixed(1) + " s"}</span>` : ""}
       </div>
       ${summary ? `<div class="stage-summary">${esc(summary)}</div>` : ""}
@@ -265,9 +266,9 @@ function upload(file) {
 async function loadSamples() {
   const samples = await api("/api/samples");
   $("#samples").innerHTML = samples.map((s, i) => `<div class="sample"><span class="sample-n">${i + 1}</span><div class="sample-main">
-      <div class="sample-top"><span class="sample-title">${esc(s.title)}</span><span class="chip ${s.expected}" title="Expected outcome">${OUTCOME[s.expected] || ""}</span></div>
+      <div class="sample-title">${esc(s.title)}</div>
       <div class="sample-desc">${esc(s.description)}</div>
-      <div class="sample-actions"><button class="btn small" data-sample="${esc(s.file)}">${SVG.play}Run</button><a href="/api/samples/${encodeURIComponent(s.file)}" target="_blank" rel="noopener">View PDF</a></div>
+      <div class="sample-actions"><button class="btn small" data-sample="${esc(s.file)}">${SVG.play}Run</button><a href="/api/samples/${encodeURIComponent(s.file)}" target="_blank" rel="noopener">View PDF</a><span class="chip ${s.expected}" title="Expected outcome">${OUTCOME[s.expected] || ""}</span></div>
     </div></div>`).join("");
 }
 
@@ -432,13 +433,13 @@ async function loadReference() {
   $("#po-body").innerHTML = ref.purchase_orders.map((p) => {
     const pct = Math.min(100, Math.round((p.invoiced / p.amount) * 100));
     return `<tr><td class="mono" style="white-space:nowrap"><b>${p.po_number}</b></td><td>${esc(vname[p.vendor_id])}</td>
-      <td>${esc(p.description)}<div class="muted" style="font-size:12px">${p.lines.map((l) => `${l.qty} × ${esc(l.description)} @ ${money(l.unit_price)}`).join(" · ")}</div></td>
-      <td>${esc(p.buyer)}</td><td class="num">${money(p.amount)}</td><td class="num">${money(p.received_value)}</td><td class="num">${money(p.invoiced)}</td><td class="num">${money(p.remaining)}</td>
+      <td class="po-for">${esc(p.description)}<div class="muted" style="font-size:12px">${p.lines.map((l) => `${l.qty} × ${esc(l.description)} @ ${money(l.unit_price)}`).join(" · ")}</div></td>
+      <td class="nowrap">${esc(p.buyer)}</td><td class="num">${money(p.amount)}</td><td class="num">${money(p.received_value)}</td><td class="num">${money(p.invoiced)}</td><td class="num">${money(p.remaining)}</td>
       <td><div class="bar"><i class="${p.remaining < 0 ? "over" : ""}" style="width:${pct}%"></i></div></td>
-      <td><span class="chip ${p.state === "closed" ? "" : p.state === "open" ? "ok" : "warn"}">${p.state}</span></td></tr>`;
+      <td><span class="chip ${p.state === "closed" ? "" : p.state === "open" ? "ok" : "warn"}">${cap(p.state)}</span></td></tr>`;
   }).join("");
   $("#vendor-body").innerHTML = ref.vendors.map((v) => `<tr><td class="mono">${v.id}</td><td><b style="font-weight:600">${esc(v.name)}</b><div class="muted" style="font-size:12px">also: ${esc(v.aliases.join(", ") || "—")}</div></td>
-      <td class="mono">${v.tax_id}</td><td class="mono">····${v.bank_last4}</td><td><span class="chip ${v.status === "approved" ? "ok" : "fail"}">${v.status}</span></td></tr>`).join("");
+      <td class="mono">${v.tax_id}</td><td class="mono">····${v.bank_last4}</td><td><span class="chip ${v.status === "approved" ? "ok" : "fail"}">${cap(v.status)}</span></td></tr>`).join("");
   const lines = ref.purchase_orders.flatMap((p) => p.lines.filter((l) => l.received < l.qty).map((l) => ({ p, l })));
   $("#receipt-form").innerHTML = `<select id="rc-line">${lines.map(({ p, l }) => `<option value="${p.po_number}|${l.line_no}" ${p.po_number === state.receiptPo ? "selected" : ""}>${p.po_number} · ${esc(l.description)} · ${l.received} of ${l.qty} received</option>`).join("")}</select>
     <input id="rc-qty" type="number" min="0.01" step="any" value="1" style="width:80px" aria-label="Quantity received"><input id="rc-by" placeholder="Your name" maxlength="60" style="width:150px">
