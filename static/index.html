@@ -6,12 +6,15 @@
   <title>Invoice Desk</title>
   <meta name="description" content="Invoice processing: from PDF to a reasoned decision, with every step visible.">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233538cd'/%3E%3Cpath d='M9 16.5l4.5 4.5L23 11' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="styles.css?v=3">
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
-      <div class="logo">ID</div>
+      <div class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></div>
       <div>
         <div class="brand-name">Invoice Desk</div>
         <div class="brand-sub">Accounts payable · Northfield Manufacturing</div>
@@ -36,7 +39,7 @@
           <h2>New invoice</h2>
           <label class="dropzone" id="dropzone">
             <input type="file" id="file-input" accept=".pdf,.png,.jpg,.jpeg" hidden>
-            <div class="dz-icon">↑</div>
+            <div class="dz-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></div>
             <div class="dz-title">Drop an invoice here</div>
             <div class="dz-sub">or click to choose a PDF, PNG or JPG</div>
           </label>
@@ -46,6 +49,7 @@
         </aside>
         <section class="panel run-panel" id="run-panel">
           <div class="empty" id="run-empty">
+            <div class="empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg></div>
             <div class="empty-title">No invoice running</div>
             <p>Upload an invoice or run a prepared scenario. You will see each stage execute here, what it checked, and the decision with its reasons.</p>
             <ol class="stage-preview" id="stage-preview"></ol>
@@ -67,6 +71,7 @@
           <h2>Invoice runs</h2>
           <div class="chips" id="filters"></div>
         </div>
+        <div id="split"></div>
         <div class="table-wrap">
           <table class="runs">
             <thead><tr><th>Received</th><th>Vendor</th><th>Invoice</th><th>PO</th><th class="num">Total</th><th>Outcome</th><th>Why</th><th>Owner</th><th class="num">Time</th></tr></thead>
@@ -110,6 +115,6 @@
   </aside>
   <div class="toast" id="toast" hidden></div>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=3"></script>
 </body>
 </html>

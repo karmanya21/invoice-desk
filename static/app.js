@@ -18,6 +18,15 @@ const touchedBy = (run) => (run.corrections || []).filter((e) => (e.kind || "cor
 const OUTCOME = { APPROVED: "Approved", HOLD: "On hold", REJECTED: "Rejected" };
 const STAGE_NAMES = ["Receive document", "Read invoice", "Validate fields and arithmetic", "Verify vendor", "Check for duplicates", "Match purchase order", "3-way match: PO balance and goods received", "Decide and route"];
 const ICON = { ok: "✓", warn: "!", fail: "✕", skipped: "–", pending: "", running: "" };
+const svg = (d) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+const SVG = {
+  doc: svg(`<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/>`),
+  bolt: svg(`<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>`),
+  clock: svg(`<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>`),
+  check: svg(`<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>`),
+  shield: svg(`<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>`),
+  play: `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="6 4 20 12 6 20 6 4"/></svg>`,
+};
 
 const state = { view: "process", filter: "all", runs: [], liveSource: null, toggled: {}, timer: null };
 
@@ -66,7 +75,16 @@ function decisionCard(run) {
   const open = run.final_state === "HOLD" && !run.review;
   const ask = open ? res.ask : null;
   const label = { APPROVED: "APPROVED · CLEARED FOR PAYMENT", HOLD: ask ? `ON HOLD · A QUESTION FOR ${esc((ask.to || run.owner || "a person").toUpperCase())}` : "ON HOLD · NEEDS A PERSON", REJECTED: "REJECTED · NOT ENTERED FOR PAYMENT" }[res.decision];
-  let h = `<div class="decision ${res.decision}"><div class="decision-label">${label}</div><div class="decision-headline">${esc(run.headline)}</div>`;
+  let h = `<div class="decision ${res.decision}"><div class="decision-banner"><div class="decision-icon">${{ APPROVED: "✓", HOLD: ask ? "?" : "!", REJECTED: "✕" }[res.decision]}</div>
+    <div><div class="decision-label">${label}</div><div class="decision-headline">${esc(run.headline)}</div></div></div>`;
+
+  const facts = [
+    ["Vendor", run.vendor_name], ["Invoice", run.invoice_number], ["Dated", run.invoice_date], ["PO", run.po_number],
+    ["Before tax", run.net_amount != null ? money(run.net_amount, cur) : null], ["Tax", run.tax_amount != null ? money(run.tax_amount, cur) : null],
+    ["Total", run.total_amount != null ? money(run.total_amount, cur) : null], ["Owner", run.owner],
+  ].filter(([, v]) => v);
+  if (facts.length) h += `<div class="facts">${facts.map(([k, v]) => `<span><span class="muted">${k}</span> <b>${esc(v)}</b></span>`).join("")}</div>`;
+  h += `<div class="decision-body">`;
 
   // A hold is a question, not a pile of evidence: ask it, recommend an answer, offer the answers.
   if (ask) {
@@ -85,15 +103,8 @@ function decisionCard(run) {
   if (res.passed?.length) h += `<div class="sub">Why</div><ul>${res.passed.map((p) => `<li>${esc(p)}</li>`).join("")}</ul>`;
   if (res.notes?.length) h += `<div class="sub">Worth knowing</div><ul>${res.notes.map((f) => `<li><b>${esc(f.title)}.</b> ${esc(f.message)}</li>`).join("")}</ul>`;
 
-  h += `<div class="sub">What happens next</div><div>${esc(res.next_action || "")}</div>`;
-  if (res.po_impact) h += `<div class="muted" style="font-size:13px">${esc(res.po_impact)}</div>`;
-
-  const facts = [
-    ["Vendor", run.vendor_name], ["Invoice", run.invoice_number], ["Dated", run.invoice_date], ["PO", run.po_number],
-    ["Before tax", run.net_amount != null ? money(run.net_amount, cur) : null], ["Tax", run.tax_amount != null ? money(run.tax_amount, cur) : null],
-    ["Total", run.total_amount != null ? money(run.total_amount, cur) : null], ["Owner", run.owner],
-  ].filter(([, v]) => v);
-  if (facts.length) h += `<div class="facts">${facts.map(([k, v]) => `<span><span class="muted">${k}</span> <b>${esc(v)}</b></span>`).join("")}</div>`;
+  h += `<div class="next"><div class="next-icon">→</div><div><div class="next-title">What happens next</div><div>${esc(res.next_action || "")}</div>
+    ${res.po_impact ? `<div class="muted">${esc(res.po_impact)}</div>` : ""}</div></div>`;
 
   for (const m of (res.messages || []).filter((m) => m.kind === "vendor")) {
     h += `<div class="message"><div class="message-head"><span>Draft reply to vendor (not sent, a person sends it) · To: <b>${esc(m.to)}</b></span>
@@ -119,12 +130,29 @@ function decisionCard(run) {
       <div class="review-row"><input id="rv-name" placeholder="Your name" maxlength="60"><input id="rv-note" placeholder="Reason (kept for audit)" maxlength="300" style="flex:2"></div>
       <div class="review-row"><button class="btn good" data-review="approve" data-run="${run.id}">Approve for payment</button><button class="btn danger" data-review="reject" data-run="${run.id}">Reject invoice</button></div></div></details>`;
   }
-  return h + `</div>`;
+  return h + `</div></div>`;
+}
+
+// While a run is in flight the server has only recorded the stages reached so far; show the whole pipeline, with the rest pending.
+function allStages(run) {
+  const got = run.stages || [];
+  if (run.status !== "running" && got.length) return got;
+  return STAGE_NAMES.map((t, i) => got.find((s) => s.seq === i + 1) || { seq: i + 1, title: t, status: "pending", details: [] });
+}
+
+// One segment per stage: the whole pipeline at a glance, filling in as it runs.
+function progress(run) {
+  const stages = allStages(run);
+  const now = stages.find((s) => s.status === "running");
+  const skipped = stages.filter((s) => s.status === "skipped").length, ran = stages.filter((s) => !["pending", "running", "skipped"].includes(s.status)).length;
+  const text = run.status === "running" ? (now ? `Stage ${now.seq} of ${stages.length} · ${esc(now.title)}` : `Stage ${Math.min(ran + 1, stages.length)} of ${stages.length}`)
+    : `${ran} of ${stages.length} stages ran${skipped ? ` · ${skipped} skipped` : ""}`;
+  return `<div class="progress"><div class="progress-bar" style="grid-template-columns:repeat(${stages.length},1fr)">${stages.map((s) => `<i class="seg ${s.status}" title="${s.seq}. ${esc(s.title)}"></i>`).join("")}</div><span class="progress-text">${text}</span></div>`;
 }
 
 function timeline(run) {
   const toggled = (state.toggled[run.id] ||= {});
-  const stages = run.stages?.length ? run.stages : STAGE_NAMES.map((t, i) => ({ seq: i + 1, title: t, status: "pending", details: [] }));
+  const stages = allStages(run);
   const lastDone = Math.max(0, ...stages.filter((s) => !["pending", "running", "skipped"].includes(s.status)).map((s) => s.seq));
   return `<ol class="timeline">${stages.map((s) => {
     const auto = run.status === "running" ? s.seq === lastDone : s.status === "warn" || s.status === "fail";
@@ -156,7 +184,7 @@ function renderRun(run, el) {
   const secs = run.duration_ms != null ? ` · ${(run.duration_ms / 1000).toFixed(1)} s end to end` : "";
   const reader = run.extractor ? ` · read by ${run.extractor === "gemini" ? "Gemini" : "offline parser"}` : "";
   $(".run-head", shell).innerHTML = `<div><div class="run-title">${esc(run.filename)}</div>
-    <div class="run-meta">Run ${run.id} · received ${when(run.created_at)}${secs}${reader}</div></div>${outcomeChip(run)}`;
+    <div class="run-meta">Run <span class="mono">${run.id}</span> · received ${when(run.created_at)}${secs}${reader}</div></div>${outcomeChip(run)}${progress(run)}`;
   const focus = document.activeElement?.id;
   const vals = { name: $("#rv-name", shell)?.value, note: $("#rv-note", shell)?.value };
   const why = run.stages?.find((x) => x.key === "extract")?.details.find((x) => x.label === "Why not the AI model")?.value;
@@ -236,11 +264,11 @@ function upload(file) {
 
 async function loadSamples() {
   const samples = await api("/api/samples");
-  $("#samples").innerHTML = samples.map((s) => `<div class="sample">
+  $("#samples").innerHTML = samples.map((s, i) => `<div class="sample"><span class="sample-n">${i + 1}</span><div class="sample-main">
       <div class="sample-top"><span class="sample-title">${esc(s.title)}</span><span class="chip ${s.expected}" title="Expected outcome">${OUTCOME[s.expected] || ""}</span></div>
       <div class="sample-desc">${esc(s.description)}</div>
-      <div class="sample-actions"><button class="btn small" data-sample="${esc(s.file)}">Run</button><a href="/api/samples/${encodeURIComponent(s.file)}" target="_blank" rel="noopener">View PDF</a></div>
-    </div>`).join("");
+      <div class="sample-actions"><button class="btn small" data-sample="${esc(s.file)}">${SVG.play}Run</button><a href="/api/samples/${encodeURIComponent(s.file)}" target="_blank" rel="noopener">View PDF</a></div>
+    </div></div>`).join("");
 }
 
 /* ---------- global click handling ---------- */
@@ -329,20 +357,23 @@ async function loadDashboard() {
   state.runs = runs;
   state.slaHours = stats.sla_hours;
   $("#kpis").innerHTML = [
-    ["Invoices processed", stats.processed, `${stats.avg_seconds} s average per invoice`],
-    ["Touchless rate", stats.processed ? stats.touchless_rate + "%" : "—", `${stats.auto_approved} approved with no human touch`],
-    ["Waiting for a person", stats.awaiting_review, `${money(stats.awaiting_value)} blocked until reviewed`, stats.awaiting_review > 0],
-    ["Cleared for payment", money(stats.cleared_value), "including invoices approved after review"],
-    ["Stopped before payment", money(stats.stopped_value), `${stats.held} held and ${stats.rejected} rejected by the process`],
-  ].map(([l, v, s, attn]) => `<div class="kpi ${attn ? "attn" : ""}"><div class="kpi-label">${l}</div><div class="kpi-value">${v}</div><div class="kpi-sub">${s}</div></div>`).join("");
+    ["Invoices processed", stats.processed, `${stats.avg_seconds} s average per invoice`, "doc", ""],
+    ["Touchless rate", stats.processed ? stats.touchless_rate + "%" : "—", `${stats.auto_approved} approved with no human touch`, "bolt", "", stats.processed ? `<div class="bar"><i class="good" style="width:${stats.touchless_rate}%"></i></div>` : ""],
+    ["Waiting for a person", stats.awaiting_review, `${money(stats.awaiting_value)} blocked until reviewed`, "clock", "t-warn" + (stats.awaiting_review > 0 ? " attn" : "")],
+    ["Cleared for payment", money(stats.cleared_value), "including invoices approved after review", "check", "t-ok"],
+    ["Stopped before payment", money(stats.stopped_value), `${stats.held} held and ${stats.rejected} rejected by the process`, "shield", "t-bad"],
+  ].map(([l, v, s, icon, cls, extra]) => `<div class="kpi ${cls}"><div class="kpi-top"><span class="kpi-label">${l}</span><span class="kpi-icon">${SVG[icon]}</span></div><div class="kpi-value">${v}</div>${extra || ""}<div class="kpi-sub">${s}</div></div>`).join("");
+  const done = runs.filter((r) => r.status !== "running"), n = (k) => done.filter((r) => r.final_state === k).length;
+  $("#split").innerHTML = !done.length ? "" : `<div class="split">${["APPROVED", "HOLD", "REJECTED"].filter(n).map((k) => `<i class="${k}" style="flex:${n(k)}"></i>`).join("")}</div>
+    <div class="split-legend">${["APPROVED", "HOLD", "REJECTED"].map((k) => `<span class="${k}"><b>${n(k)}</b> ${OUTCOME[k].toLowerCase()}</span>`).join("")}</div>`;
   const mins = stats.minutes_saved, hrs = mins >= 60 ? (mins / 60).toFixed(1) + " hours" : mins + " minutes";
   $("#impact").innerHTML = !stats.processed ? `<div class="muted">Process an invoice to see the impact.</div>` : `
     <div class="impact-line"><b>${hrs}</b> of manual work avoided on ${stats.processed} invoice${stats.processed === 1 ? "" : "s"}
       <span class="muted">· assumes ${stats.impact.manual_minutes_per_invoice} min to handle an invoice by hand and ${stats.impact.review_minutes_per_hold} min for a person to answer a prepared question</span></div>
     ${stats.resumed || stats.corrected ? `<div class="muted" style="margin:-6px 0 12px;font-size:13px">${stats.resumed} held invoice${stats.resumed === 1 ? "" : "s"} re-checked by the process when data changed · ${stats.corrected} resolved by a person's correction or answer</div>` : ""}
-    ${stats.reasons.length ? `<table><thead><tr><th>Why invoices were stopped</th><th>Outcome</th><th>Goes to</th><th class="num">Invoices</th><th class="num">Value protected</th></tr></thead><tbody>
+    ${stats.reasons.length ? `<div class="table-wrap"><table><thead><tr><th>Why invoices were stopped</th><th>Outcome</th><th>Goes to</th><th class="num">Invoices</th><th class="num">Value protected</th></tr></thead><tbody>
       ${stats.reasons.map((g) => `<tr><td>${esc(g.reason)}</td><td><span class="chip ${g.outcome}">${OUTCOME[g.outcome]}</span></td><td>${esc(g.owner || "")}</td><td class="num">${g.count}</td><td class="num">${money(g.value)}</td></tr>`).join("")}
-    </tbody></table>` : `<div class="muted">Nothing has been stopped yet.</div>`}`;
+    </tbody></table></div>` : `<div class="muted">Nothing has been stopped yet.</div>`}`;
   $("#filters").innerHTML = FILTERS.map(([k, l]) => `<button data-filter="${k}" class="${state.filter === k ? "active" : ""}">${l}</button>`).join("");
   renderRows();
   setBadge(stats.awaiting_review);
@@ -362,7 +393,7 @@ function renderRows() {
   $("#runs-body").innerHTML = rows.map((r) => `<tr data-run="${r.id}">
       <td class="muted" style="white-space:nowrap">${when(r.created_at)}</td>
       <td><b style="font-weight:600">${esc(r.vendor_name || "Unknown")}</b><div class="muted" style="font-size:12px">${esc(r.filename)}</div></td>
-      <td>${esc(r.invoice_number || "—")}</td><td>${esc(r.po_number || "—")}</td>
+      <td class="mono">${esc(r.invoice_number || "—")}</td><td class="mono">${esc(r.po_number || "—")}</td>
       <td class="num">${money(r.total_amount, r.currency)}</td>
       <td>${outcomeChip(r)}</td>
       <td class="why">${esc(r.headline || "")}</td>
@@ -400,14 +431,14 @@ async function loadReference() {
   const vname = Object.fromEntries(ref.vendors.map((v) => [v.id, v.name]));
   $("#po-body").innerHTML = ref.purchase_orders.map((p) => {
     const pct = Math.min(100, Math.round((p.invoiced / p.amount) * 100));
-    return `<tr><td><b style="font-weight:600">${p.po_number}</b></td><td>${esc(vname[p.vendor_id])}</td>
+    return `<tr><td class="mono" style="white-space:nowrap"><b>${p.po_number}</b></td><td>${esc(vname[p.vendor_id])}</td>
       <td>${esc(p.description)}<div class="muted" style="font-size:12px">${p.lines.map((l) => `${l.qty} × ${esc(l.description)} @ ${money(l.unit_price)}`).join(" · ")}</div></td>
       <td>${esc(p.buyer)}</td><td class="num">${money(p.amount)}</td><td class="num">${money(p.received_value)}</td><td class="num">${money(p.invoiced)}</td><td class="num">${money(p.remaining)}</td>
       <td><div class="bar"><i class="${p.remaining < 0 ? "over" : ""}" style="width:${pct}%"></i></div></td>
       <td><span class="chip ${p.state === "closed" ? "" : p.state === "open" ? "ok" : "warn"}">${p.state}</span></td></tr>`;
   }).join("");
-  $("#vendor-body").innerHTML = ref.vendors.map((v) => `<tr><td>${v.id}</td><td><b style="font-weight:600">${esc(v.name)}</b><div class="muted" style="font-size:12px">also: ${esc(v.aliases.join(", ") || "—")}</div></td>
-      <td>${v.tax_id}</td><td>····${v.bank_last4}</td><td><span class="chip ${v.status === "approved" ? "ok" : "fail"}">${v.status}</span></td></tr>`).join("");
+  $("#vendor-body").innerHTML = ref.vendors.map((v) => `<tr><td class="mono">${v.id}</td><td><b style="font-weight:600">${esc(v.name)}</b><div class="muted" style="font-size:12px">also: ${esc(v.aliases.join(", ") || "—")}</div></td>
+      <td class="mono">${v.tax_id}</td><td class="mono">····${v.bank_last4}</td><td><span class="chip ${v.status === "approved" ? "ok" : "fail"}">${v.status}</span></td></tr>`).join("");
   const lines = ref.purchase_orders.flatMap((p) => p.lines.filter((l) => l.received < l.qty).map((l) => ({ p, l })));
   $("#receipt-form").innerHTML = `<select id="rc-line">${lines.map(({ p, l }) => `<option value="${p.po_number}|${l.line_no}" ${p.po_number === state.receiptPo ? "selected" : ""}>${p.po_number} · ${esc(l.description)} · ${l.received} of ${l.qty} received</option>`).join("")}</select>
     <input id="rc-qty" type="number" min="0.01" step="any" value="1" style="width:80px" aria-label="Quantity received"><input id="rc-by" placeholder="Your name" maxlength="60" style="width:150px">
