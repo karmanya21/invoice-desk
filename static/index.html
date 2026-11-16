@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Invoice Desk</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">ID</div>
+      <div>
+        <div class="brand-name">Invoice Desk</div>
+        <div class="brand-sub">Accounts payable · Northfield Manufacturing</div>
+      </div>
+    </div>
+    <nav class="tabs" id="tabs">
+      <button data-view="process" class="active">Process invoice</button>
+      <button data-view="dashboard">Dashboard <span class="badge" id="review-badge" hidden></span></button>
+      <button data-view="reference">POs, vendors and rules</button>
+    </nav>
+    <div class="top-actions">
+      <span class="pill" id="ai-pill" title="">Checking reader…</span>
+      <button class="btn ghost" id="reset-btn" title="Delete all runs and restore PO balances">Reset demo data</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Process -->
+    <section id="view-process" class="view">
+      <div class="process-grid">
+        <aside class="panel intake">
+          <h2>New invoice</h2>
+          <label class="dropzone" id="dropzone">
+            <input type="file" id="file-input" accept=".pdf,.png,.jpg,.jpeg" hidden>
+            <div class="dz-icon">↑</div>
+            <div class="dz-title">Drop an invoice here</div>
+            <div class="dz-sub">or click to choose a PDF, PNG or JPG</div>
+          </label>
+          <h3>Prepared scenarios</h3>
+          <p class="hint">Real PDFs in different vendor layouts. Order matters for the two that depend on earlier invoices.</p>
+          <div id="samples" class="samples"></div>
+        </aside>
+        <section class="panel run-panel" id="run-panel">
+          <div class="empty" id="run-empty">
+            <div class="empty-title">No invoice running</div>
+            <p>Upload an invoice or run a prepared scenario. You will see each stage execute here, what it checked, and the decision with its reasons.</p>
+            <ol class="stage-preview" id="stage-preview"></ol>
+          </div>
+          <div id="run-live"></div>
+        </section>
+      </div>
+    </section>
+
+    <!-- Dashboard -->
+    <section id="view-dashboard" class="view" hidden>
+      <div class="kpis" id="kpis"></div>
+      <div class="panel">
+        <div class="table-head">
+          <h2>Invoice runs</h2>
+          <div class="chips" id="filters"></div>
+        </div>
+        <div class="table-wrap">
+          <table class="runs">
+            <thead><tr><th>Received</th><th>Vendor</th><th>Invoice</th><th>PO</th><th class="num">Total</th><th>Outcome</th><th>Why</th><th>Owner</th><th class="num">Time</th></tr></thead>
+            <tbody id="runs-body"></tbody>
+          </table>
+          <div class="empty small" id="runs-empty" hidden>No invoices yet. Process one to see it here.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Reference -->
+    <section id="view-reference" class="view" hidden>
+      <div class="panel">
+        <h2>Purchase orders</h2>
+        <p class="hint">The procurement data invoices are matched against. Balances move as invoices are approved.</p>
+        <div class="table-wrap"><table><thead><tr><th>PO</th><th>Vendor</th><th>For</th><th>Buyer</th><th class="num">Value</th><th class="num">Invoiced</th><th class="num">Remaining</th><th style="width:150px">Used</th><th>State</th></tr></thead><tbody id="po-body"></tbody></table></div>
+      </div>
+      <div class="ref-grid">
+        <div class="panel">
+          <h2>Approved vendors</h2>
+          <div class="table-wrap"><table><thead><tr><th>ID</th><th>Name</th><th>Tax ID</th><th>Bank acct</th><th>Status</th></tr></thead><tbody id="vendor-body"></tbody></table></div>
+        </div>
+        <div class="panel">
+          <h2>Decision rules</h2>
+          <p class="hint">The AI model only reads the document. These rules make every decision.</p>
+          <ul class="rules" id="rules"></ul>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+  <aside class="drawer" id="drawer" hidden>
+    <button class="drawer-close" id="drawer-close" aria-label="Close">×</button>
+    <div id="drawer-body"></div>
+  </aside>
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
