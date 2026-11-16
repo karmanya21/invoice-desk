@@ -1,7 +1,7 @@
 # Invoice Desk — Zamp ASA case study, PS-1 (invoice processing)
 
 Takes a vendor invoice (PDF or image) and produces a reasoned decision:
-**Approved**, **On hold** (routed to a named owner), or **Rejected** (with a drafted reply to the vendor).
+**Approved**, **On hold** (a specific question to a named owner, with a recommended answer), or **Rejected** (with a drafted reply to the vendor).
 Every stage is visible live, and every run is kept in a dashboard.
 
 ## Run it
@@ -27,7 +27,10 @@ Without a key the app still runs: digital PDFs are read by an offline parser, sc
 | 5 | Duplicates | Same file, same invoice number, or same vendor + amount + date under a new number | Reject (exact), Hold (probable) |
 | 6 | Match PO | Use the PO printed on the invoice, or infer it from the vendor's open POs | Hold (not found, wrong vendor, ambiguous) |
 | 7 | 3-way match | Compare with what is *left* on the PO and what has been *received*, unit prices, quantities, tax | Hold (over PO, not received, price, tax) |
-| 8 | Decide | Most severe finding wins. Names an owner and the next step | – |
+| 8 | Decide | Most severe finding wins. A hold becomes a question for a named owner | Hold (above approval limit) |
+
+After the decision, three things can move a held invoice without anyone re-submitting it:
+a person **answers the question**, a person **corrects a field**, or the **data changes** (a goods receipt is recorded, a rule is changed, a vendor name is confirmed) and the process re-checks every open hold by itself.
 
 Stages do not stop at the first problem, so a reviewer sees everything wrong in one go.
 
@@ -39,6 +42,13 @@ Stages do not stop at the first problem, so a reviewer sees everything wrong in 
 - **A person can correct the read, not the rules.** On a held or rejected invoice a reviewer can fix a misread field or key in a missing one. The rules then decide again, and who changed what and why is kept on the run. A corrected invoice no longer counts as touchless.
 - **Fast by doing the slow thing first.** The model read starts the moment the file arrives, overlapping intake, and a slow or busy model is abandoned after 6 seconds for the next one. A run takes about 3 seconds, nearly all of it the read.
 - **Quota-aware.** One model request per digital invoice, two per scan. The Gemini free tier allows only a small number of requests per model per day (20 on `gemini-3.6-flash` when tested), so a model that reports its quota is used up is skipped until it resets, and if every model is out the offline parser takes over for digital PDFs.
+- **A hold is a question, not a queue.** Every hold names who must answer, asks one specific question ("Does INV-20831-R replace INV-20831?"), recommends an answer and offers the answers as buttons. Unanswered holds show how long they have waited and when they escalate (48 hours by default). Escalation is shown, not sent: there is no notification system behind it.
+- **Holds resume by themselves.** If an invoice is waiting on a goods receipt, recording the receipt clears it with no one touching the invoice. A re-check that changes nothing leaves no trace. Doubts about the read itself (two models disagreeing) are carried through a re-check, never dropped.
+- **It learns from answers.** If a known vendor bills under an unfamiliar name but the same tax ID, the process asks once whether it is the same company. A "yes" is saved to the vendor master and logged, so it is never asked again.
+- **The process owner owns the thresholds.** Tolerances, limits and the escalation window are editable in the UI with a name attached; each change is logged and every held invoice is re-checked against it. No code change.
+- **Touchless must be earned.** Above the approval limit ($50,000 by default) even a clean invoice needs the finance controller's sign-off.
+- **What is billed must be on the PO.** Fitting inside the remaining balance is not enough: unrelated items, extra units, credit notes and zero-value documents are all stopped.
+- **One invoice commits at a time.** History and PO-balance checks run under a lock, so two invoices arriving together cannot both draw on the same balance. (One process, one lock; several servers would need this in the database.)
 - **Three outcomes, not two.** Reject is for things only the vendor can fix or that must never be paid. Hold is for things a person inside the company can resolve. Each hold names who.
 - **Balance, not PO value.** Invoices are compared with the remaining PO balance, which is what makes split POs work.
 - **Held invoices do not consume PO balance** until a named person approves with a reason. The process's decision and the human's are both kept.
@@ -52,7 +62,12 @@ Stages do not stop at the first problem, so a reviewer sees everything wrong in 
 3. **Reissued duplicate.** `05` is the happy-path invoice with a new number (`INV-20831-R`). Number matching misses it; vendor + amount + date catches it.
 4. **Look-alike vendor with new bank details.** `06` has a near-identical name, transposed tax ID and a different account → held as possible impersonation, with a call-back instruction.
 
-Also handled: missing invoice number/date (`07`, rejected with a drafted reply), exact re-upload, blocked vendor, unknown PO, PO of another vendor, price variance, small overage within tolerance.
+Two more samples show what happens *after* a hold:
+
+- **Billed before delivery** (`08`): two months of storage billed, one confirmed. Held with the question "has the rest been delivered?". Record the receipt on the reference tab and the invoice approves itself.
+- **Unfamiliar vendor name** (`09`): "BW Hosting" with Brightwave's tax ID and bank account. Answer "yes, same company" once; the name is remembered and the invoice is re-checked and approved.
+
+Also handled (covered by tests, no sample): missing invoice number/date (`07` is the sample), exact re-upload, blocked vendor, unknown PO, PO of another vendor, price variance, small overage or price difference within tolerance, items not on the PO, more units than ordered, credit notes, zero-value invoices, a tax-inclusive total with no rate printed, a clean invoice above the approval limit, and two invoices for the same PO arriving at the same moment.
 
 ## Assumptions
 
@@ -71,8 +86,11 @@ Also handled: missing invoice number/date (`07`, rejected with a drafted reply),
 3. `05` Reissued duplicate → held, points at the original run.
 4. `06` Look-alike vendor → held for the vendor master team.
 5. `04` Scanned, no PO → approved with the PO inferred (needs the Gemini key).
-6. `07` Missing information → rejected with a drafted reply. Then correct the fields (invoice number, date) and re-check → approved, with the correction on record.
-7. Dashboard: KPIs, business impact, filter "Needs review", approve `03` as the buyer with a reason.
+6. `08` Billed before delivery → held with a question. Click "It has arrived: record the receipt", record it, and the invoice approves itself.
+7. `09` Unfamiliar vendor name → answer "Yes, same company". It is remembered (see the reference tab) and the invoice is approved.
+8. Dashboard: KPIs, business impact, "Needs review"; answer the question on `03` or `05`.
+
+That is more than five minutes. For the video, pick the happy path plus two or three of these; keep the rest for the interview. `07` (missing information, then correct the fields and re-check) is a good spare.
 
 Press "Reset demo data" before each rehearsal.
 

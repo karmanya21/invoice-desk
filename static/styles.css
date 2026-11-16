@@ -193,3 +193,25 @@ table.runs tbody tr:hover { background: var(--soft); }
 .impact-line { font-size: 15px; margin: 6px 0 12px; }
 .impact-line b { font-size: 20px; font-weight: 650; }
 .impact-line .muted { font-size: 13px; }
+
+/* a hold is a question */
+.ask { background: #fff; border: 1px solid var(--warn-line); border-radius: 10px; padding: 14px 16px; margin: 4px 0 12px; }
+.ask-q { font-size: 16px; font-weight: 650; }
+.ask-rec { margin-top: 4px; font-size: 13.5px; }
+.ask input { padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; font: inherit; flex: 1; }
+.ask-sla { margin-top: 10px; font-size: 12.5px; color: var(--muted); }
+.overdue { color: var(--bad) !important; font-weight: 600; }
+.link { color: var(--accent); text-decoration: none; font-size: 13px; }
+.link:hover { text-decoration: underline; }
+.strip { background: var(--warn-bg); border: 1px solid var(--warn-line); color: var(--warn); border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13.5px; }
+/* reference: receipts and editable rules */
+.receipt-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; background: var(--soft); border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; font-size: 13.5px; }
+.receipt-form { display: inline-flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.receipt-form select, .receipt-form input, .rule-row input { padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px; font: inherit; background: #fff; }
+.receipt-form select { max-width: 420px; }
+.rule-inputs { border: 1px solid var(--line); border-radius: 10px; margin-bottom: 6px; }
+.rule-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 7px 12px; border-bottom: 1px solid var(--soft); flex-wrap: wrap; font-size: 13.5px; }
+.rule-row:last-child { border-bottom: 0; }
+.rule-row input[type=number] { width: 110px; text-align: right; }
+.kpi-value { overflow-wrap: anywhere; }
+@media (max-width: 860px) { .kpi-value { font-size: 20px; } }

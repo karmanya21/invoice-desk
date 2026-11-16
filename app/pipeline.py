@@ -98,6 +98,15 @@ def parse_date(s):
     return None
 
 
+def opt(label, action):
+    """An answer a person can give to a hold. action: approve | reject | fix | receipt | learn_alias."""
+    return {"label": label, "action": action}
+
+
+FIX = opt("Correct the fields and re-check", "fix")
+REJECT_IT = opt("Reject the invoice", "reject")
+
+
 def d(label, value, status=None):
     return {"label": label, "value": value, "status": status}
 
@@ -121,10 +130,13 @@ class Ctx:
         self.po = None
         self.po_match = None     # "stated" | "inferred"
         self.stop = None         # reason later stages are skipped
+        self.net_is_total = False  # no tax shown on the invoice at all
+        self.carry = []          # findings from the original read that a re-check must not lose
 
-    def find(self, stage, code, severity, title, message, owner="AP analyst", vendor_msg=None):
-        self.findings.append({"stage": stage, "code": code, "severity": severity, "title": title,
-                              "message": message, "owner": owner, "vendor_msg": vendor_msg})
+    def find(self, stage, code, severity, title, message, owner="AP analyst", vendor_msg=None, ask=None, related=None):
+        """Record a finding. `ask` turns a hold into a question: {question, recommend, options[{label, action}]}."""
+        self.findings.append({"stage": stage, "code": code, "severity": severity, "title": title, "message": message,
+                              "owner": owner, "vendor_msg": vendor_msg, "ask": ask, "related": related})
 
     def worst(self, stage):
         sev = [f["severity"] for f in self.findings if f["stage"] == stage]
@@ -165,9 +177,14 @@ def stage_extract(c: Ctx):
     if c.override is not None:
         last = c.corrections[-1]
         c.inv, c.meta = c.override, {"extractor": "corrected"}
-        details = [d("Read by", f"Earlier read, corrected by {last['by']}")]
-        details += [d(f"Corrected: {ch['field']}", f"{ch['from'] if ch['from'] is not None else 'nothing'} changed to {ch['to'] if ch['to'] is not None else 'nothing'}", "warn") for ch in last["changes"]]
-        details.append(d("Reason given", last["note"]))
+        if last.get("kind", "correction") == "correction":
+            details = [d("Read by", f"Earlier read, corrected by {last['by']}")]
+            details += [d(f"Corrected: {ch['field']}", f"{ch['from'] if ch['from'] is not None else 'nothing'} changed to {ch['to'] if ch['to'] is not None else 'nothing'}", "warn") for ch in last["changes"]]
+            details.append(d("Reason given", last["note"]))
+        else:
+            details = [d("Read by", "Earlier read, not repeated"), d("Why it is being re-checked", last["note"])]
+            c.findings += c.carry   # doubts about the read itself are not settled by new data
+            details += [d("Still open from the first read", f["title"], "fail") for f in c.carry]
         db.update_run(c.run_id, extraction=c.inv)
     else:
         try:
@@ -274,10 +291,27 @@ def stage_validate(c: Ctx):
         how = f"tax is embedded in the total, backed out at the {rate:g}% printed on the invoice"
     elif total is not None:
         c.net, how = total, "no tax shown anywhere, total treated as the pre-tax amount"
+        c.net_is_total = True
     else:
         how = None
     if c.net is not None:
         details.append(d("Amount before tax", f"{money(c.net, cur)} ({how})", None if sub is not None else "warn"))
+
+    # A credit note or a zero invoice is not something to pay. Matching it like an invoice
+    # would "approve" it as a payment, so it leaves the normal path here.
+    if total is not None and (total < 0 or (c.net is not None and c.net < 0)):
+        c.find("validate", "CREDIT_NOTE", HOLD, "This is a credit note, not an invoice to pay",
+               f"The total is {money(total, cur)}. A credit reduces what we owe the vendor. It must be applied against their open invoices, never scheduled as a payment.",
+               ask={"question": "Which open invoice or PO should this credit be applied to?", "recommend": "Apply it in the ledger, then close this item. Do not approve it for payment.",
+                    "options": [opt("Applied in the ledger, close it", "reject")]})
+        details.append(d("Document type", "credit note (negative total)", "fail"))
+        c.stop = "a credit note is not a payment and follows a different process"
+    elif total is not None and abs(total) < 0.005:
+        c.find("validate", "ZERO_VALUE", HOLD, "Invoice is for zero",
+               "The total is zero, so there is nothing to pay. It may be a statement, a pro-forma, or a misread.",
+               ask={"question": "Is the zero total correct?", "recommend": "Check the document. If the total was misread, correct it.", "options": [FIX, opt("Yes, nothing to pay. Close it", "reject")]})
+        details.append(d("Document type", "zero-value document", "fail"))
+        c.stop = "there is nothing to pay"
 
     # The invoice's own arithmetic.
     slack, problems, checked = R["arithmetic_slack"], [], 0
@@ -296,7 +330,9 @@ def stage_validate(c: Ctx):
         if abs(sub + tax - total) > slack:
             problems.append(f"subtotal + tax is {money(sub + tax, cur)} but the total says {money(total, cur)}")
     if problems:
-        c.find("validate", "ARITHMETIC", HOLD, "The invoice's own numbers do not add up", "; ".join(problems).capitalize() + ". Confirm the correct amount with the vendor before paying.")
+        c.find("validate", "ARITHMETIC", HOLD, "The invoice's own numbers do not add up", "; ".join(problems).capitalize() + ". Confirm the correct amount with the vendor before paying.",
+               ask={"question": "What is the correct amount on this invoice?", "recommend": "Compare with the document on the right. If it was misread, correct the fields. If the vendor's maths is wrong, reject it.",
+                    "options": [FIX, opt("Vendor's figures are wrong, reject", "reject")]})
     details.append(d("Arithmetic", "; ".join(problems) if problems else (f"{checked} checks passed" if checked else "nothing to cross-check (single bundled amount)"),
                      "fail" if problems else ("ok" if checked else "warn")))
 
@@ -329,7 +365,8 @@ def stage_vendor(c: Ctx):
         return SKIP, "No vendor name on the document to verify", []
     target = norm_vendor(name)
     best, best_score, exact = None, 0.0, False
-    for v in db.vendors():
+    vendors = db.vendors()
+    for v in vendors:
         for candidate in [v["name"], *v["aliases"]]:
             cn = norm_vendor(candidate)
             score = 1.0 if cn == target else SequenceMatcher(None, cn, target).ratio()
@@ -338,9 +375,31 @@ def stage_vendor(c: Ctx):
 
     details = [d("Name on invoice", name)]
     if not best or best_score < R["vendor_fuzzy_threshold"]:
+        # The name is new to us. If the tax ID belongs to exactly one approved vendor, this is
+        # probably a trading name: ask once, remember the answer, never ask again.
+        tax = digits(inv["vendor_tax_id"])
+        known = [v for v in vendors if tax and digits(v["tax_id"]) == tax and v["status"] == "approved"]
+        if len(known) == 1:
+            v = known[0]
+            c.vendor, c.vendor_match = v, "tax_id"
+            bank = digits(inv["bank_account"])[-4:]
+            bank_ok = bool(bank) and bank == v["bank_last4"]
+            details += [d("Vendor master", f"no vendor called '{name}'", "warn"), d("Tax ID", f"{inv['vendor_tax_id']} belongs to {v['name']} ({v['id']})", "ok"),
+                        d("Pay-to account", f"ending {bank} " + ("matches" if bank_ok else f"does not match (ending {v['bank_last4']} on file)") if bank else "not on the invoice", "ok" if bank_ok else "fail" if bank else "warn")]
+            c.find("vendor", "VENDOR_NAME_UNRECOGNISED", HOLD, "Vendor name is new, but its tax ID belongs to a vendor we know",
+                   f"No approved vendor is called '{name}'. The tax ID on the invoice ({inv['vendor_tax_id']}) is the one on file for {v['name']}"
+                   + (f", and the pay-to account ending {bank} matches too." if bank_ok else f", but the pay-to account ending {bank} is not the one on file. Treat with care." if bank else "."),
+                   owner="Vendor master team",
+                   ask={"question": f"Is '{name}' another name for {v['name']}?",
+                        "recommend": ("Yes. Tax ID and bank account both match our records, so this is very likely a trading name." if bank_ok
+                                      else "Confirm with the vendor on the phone number already on file before answering yes."),
+                        "options": [opt("Yes, same company. Remember this name", "learn_alias"), opt("No, reject it", "reject")]})
+            return WARN, f"Name not recognised, tax ID matches {v['name']}", details
         c.find("vendor", "UNKNOWN_VENDOR", HOLD, "Vendor is not in the approved vendor list",
                f"'{name}' does not match any approved vendor (closest: {best['name'] if best else 'none'}, {best_score:.0%} similar). "
-               "Do not pay until the vendor has been onboarded.", owner="Vendor master team")
+               "Do not pay until the vendor has been onboarded.", owner="Vendor master team",
+               ask={"question": "Should this vendor be onboarded, or is the invoice not for us?", "recommend": "Do not pay an unknown vendor. Send them through vendor onboarding first, or correct the name if it was misread.",
+                    "options": [FIX, opt("Not a vendor of ours, reject", "reject")]})
         details.append(d("Vendor master", "no match", "fail"))
         return WARN, "Vendor not found in the approved list", details
 
@@ -382,7 +441,10 @@ def stage_vendor(c: Ctx):
         c.find("vendor", "VENDOR_IDENTITY", HOLD, "Vendor identity does not match our records, possible impersonation",
                "This invoice looks like it is from " + best["name"] + " but: " + "; ".join(signals) + ". "
                f"Do not pay and do not update bank details from this document. Call the vendor on the number already on file ({best['contact_email']} is the contact on record) to confirm.",
-               owner="Vendor master team")
+               owner="Vendor master team",
+               ask={"question": f"Has {best['name']} confirmed, on the contact details we already hold, that they sent this invoice and changed their details?",
+                    "recommend": "Reject unless a call-back has confirmed it. This is the standard pattern for vendor impersonation.",
+                    "options": [opt("Not confirmed, reject", "reject"), opt("Confirmed by call-back, approve", "approve")]})
         return WARN, "Identity mismatch against the vendor master", details
     return c.worst("vendor"), f"Matched to {best['name']}", details
 
@@ -396,7 +458,7 @@ def stage_duplicate(c: Ctx):
         p = same_file[0]
         c.find("duplicate", "DUPLICATE_FILE", REJECT, "Exact same file was already submitted",
                f"This file is byte-for-byte identical to the one processed in run {p['id']} (currently {p['final_state']}). Nothing new to pay.",
-               vendor_msg=f"This invoice ({p['invoice_number'] or 'no number'}) was already received and is being handled. No need to resend it.")
+               vendor_msg=f"This invoice ({p['invoice_number'] or 'no number'}) was already received and is being handled. No need to resend it.", related=p["id"])
         details.append(d("Same file seen before", f"yes, run {p['id']}", "fail"))
     else:
         details.append(d("Same file seen before", "no", "ok"))
@@ -412,7 +474,7 @@ def stage_duplicate(c: Ctx):
         p = exact[0]
         c.find("duplicate", "DUPLICATE_NUMBER", REJECT, "Duplicate invoice number",
                f"{c.vendor['name']} invoice {inv['invoice_number']} was already processed in run {p['id']} ({p['final_state']}, {money(p['total_amount'], cur)}). Paying it again would be a double payment.",
-               vendor_msg=f"Invoice {inv['invoice_number']} has already been received. Please do not resubmit it.")
+               vendor_msg=f"Invoice {inv['invoice_number']} has already been received. Please do not resubmit it.", related=p["id"])
         details.append(d("Same invoice number", f"yes, run {p['id']}", "fail"))
     else:
         details.append(d("Same invoice number", "no", "ok"))
@@ -436,7 +498,11 @@ def stage_duplicate(c: Ctx):
                f"Different invoice number ({inv['invoice_number']} vs {p['invoice_number']}) but same vendor, same total {money(inv['total'], cur)}"
                + (f" and dates {gap} day{'s' if gap != 1 else ''} apart" if gap is not None else "")
                + (", and the numbers are variants of each other" if related else "")
-               + f". Looks like run {p['id']} reissued. Confirm with the vendor whether this replaces the earlier invoice or is a genuinely separate charge.")
+               + f". Looks like run {p['id']} reissued.",
+               related=p["id"],
+               ask={"question": f"Does {inv['invoice_number']} replace {p['invoice_number']}, or is it a separate charge?",
+                    "recommend": f"Reject as a reissue. Same vendor, same amount" + (", same or near date" if gap is not None else "") + (", and the number is a variant of the earlier one." if related else "."),
+                    "options": [opt("It is a reissue, reject it", "reject"), opt("Separate charge, pay it", "approve")]})
         details.append(d("Same vendor, amount and date", f"yes, run {p['id']} ({p['invoice_number']})", "fail"))
     else:
         details.append(d("Same vendor, amount and date", f"no match in {len(prior)} earlier invoice{'s' if len(prior) != 1 else ''} from this vendor", "ok"))
@@ -471,7 +537,7 @@ def stage_po_match(c: Ctx):
         po = db.purchase_order(ref)
         if not po:
             c.find("po_match", "PO_NOT_FOUND", HOLD, "PO number on the invoice does not exist",
-                   f"{ref} is not in the procurement system. It may be mistyped. Ask the buyer or vendor for the correct PO.")
+                   f"{ref} is not in the procurement system. It may be mistyped.", ask={"question": "Which purchase order is this invoice for?", "recommend": "Enter the correct PO number and re-check. If there is no PO, it needs the budget owner's approval outside this process.", "options": [FIX, REJECT_IT]})
             details.append(d("Procurement system", "no such PO", "fail"))
             return WARN, f"{ref} not found", details
         if c.vendor and po["vendor_id"] != c.vendor["id"]:
@@ -501,7 +567,7 @@ def stage_po_match(c: Ctx):
     if score < R["implied_po_min_score"] or margin < R["implied_po_min_margin"]:
         c.find("po_match", "PO_AMBIGUOUS", HOLD, "Could not confidently work out which PO this invoice is for",
                f"No PO is quoted. Best guess is {best['po_number']} (score {score:.2f}) but that is not a clear enough winner to pay against. "
-               "Pick the right PO or ask the vendor to quote it.", owner=f"Buyer ({best['buyer']})")
+               "The candidates and their scores are listed under 'Match purchase order'.", owner=f"Buyer ({best['buyer']})", ask={"question": "Which purchase order is this invoice for?", "recommend": "Enter the correct PO number and re-check. If there is no PO, it needs the budget owner's approval outside this process.", "options": [FIX, REJECT_IT]})
         return WARN, "PO could not be inferred with confidence", details
 
     c.po, c.po_match = best, "inferred"
@@ -509,7 +575,9 @@ def stage_po_match(c: Ctx):
     if c.net is not None and c.net > R["implied_po_auto_limit"]:
         c.find("po_match", "PO_INFERRED_OVER_LIMIT", HOLD, "PO was inferred, and the amount is above the auto-approval limit for inferred matches",
                f"The invoice quotes no PO. The process matched it to {best['po_number']} by vendor, amount and description, but inferred matches above "
-               f"{money(R['implied_po_auto_limit'])} need a person to confirm.", owner=f"Buyer ({best['buyer']})")
+               f"{money(R['implied_po_auto_limit'])} need a person to confirm.", owner=f"Buyer ({best['buyer']})",
+               ask={"question": f"Is this invoice for {best['po_number']} ({best['description']})?", "recommend": f"Yes, if the description fits. It is the only open PO for this vendor that matches both amount and description.",
+                    "options": [opt(f"Yes, it is for {best['po_number']}. Approve", "approve"), FIX, REJECT_IT]})
         return WARN, f"Inferred {best['po_number']}, needs confirmation at this value", details
     c.find("po_match", "PO_INFERRED", INFO, "PO was inferred, not stated",
            f"The invoice quotes no PO number. Matched to {best['po_number']} ({best['description']}) because it is this vendor's only open PO that fits both the amount and the description.")
@@ -537,6 +605,12 @@ def _best_po_line(li, po):
     return line if score >= 0.5 else None
 
 
+def _receipt_ask(po):
+    return {"question": f"Has the rest of {po['po_number']} been delivered but not booked in yet?",
+            "recommend": "Wait for the receipt. Nothing needs deciding now: the invoice will clear itself once the goods are booked in.",
+            "options": [opt("It has arrived: record the receipt", "receipt"), opt("Not delivered, reject", "reject")]}
+
+
 def stage_amounts(c: Ctx):
     inv, po, details = c.inv, c.po, []
     cur = inv["currency"]
@@ -545,6 +619,15 @@ def stage_amounts(c: Ctx):
     buyer = f"Buyer ({po['buyer']})"
     remaining, net = po["remaining"], c.net
     tol = round(min(R["tolerance_abs"], po["amount"] * R["tolerance_pct"] / 100), 2)
+    # One total and no tax anywhere on the invoice: if it only fits the PO once tax at the
+    # PO's rate is taken out, read it as tax-inclusive (and say so) instead of raising a false alarm.
+    if c.net_is_total and po["tax_rate"] and net is not None and net > remaining + tol:
+        alt = round(net / (1 + po["tax_rate"] / 100), 2)
+        if alt <= remaining + tol:
+            c.tax_derived = round(net - alt, 2)
+            c.find("amounts", "TAX_ASSUMED_INCLUDED", INFO, "Total read as tax-inclusive",
+                   f"The invoice shows a single total of {money(net, cur)} and no tax. At the {po['tax_rate']:g}% expected on {po['po_number']} that is {money(alt, cur)} before tax, which fits the PO, so it was read that way.")
+            c.net = net = alt
     details += [
         d("PO value", money(po["amount"], cur)),
         d("Already invoiced", money(po["invoiced"], cur) + (f" across {len(po['invoices'])} invoice{'s' if len(po['invoices']) != 1 else ''}" if po["invoices"] else "")),
@@ -566,7 +649,9 @@ def stage_amounts(c: Ctx):
         c.find("amounts", "OVER_PO", HOLD, "Invoice exceeds what is left on the PO",
                f"Invoice is {money(net, cur)} before tax but only {money(remaining, cur)} remains on {po['po_number']} "
                f"({money(po['invoiced'], cur)} of {money(po['amount'], cur)} already invoiced). Over by {money(over, cur)} ({over / po['amount']:.1%} of the PO), "
-               f"beyond the {money(tol, cur)} tolerance. The buyer must either amend the PO or dispute the excess.", owner=buyer)
+               f"beyond the {money(tol, cur)} tolerance.", owner=buyer,
+               ask={"question": f"Did you agree to pay {money(over, cur)} more than {po['po_number']} allows?", "recommend": "Dispute the excess unless the PO has been amended.",
+                    "options": [opt("No, reject and dispute the excess", "reject"), opt("Yes, PO was amended. Approve", "approve")]})
         details.append(d("Result", f"over by {money(over, cur)}, beyond tolerance", "fail"))
     elif over > 0.005:
         c.find("amounts", "WITHIN_TOLERANCE", INFO, "Small overage accepted within tolerance",
@@ -590,10 +675,21 @@ def stage_amounts(c: Ctx):
         c.find("amounts", "NOT_RECEIVED", HOLD, "Invoice bills for more than has been received",
                f"Invoice is {money(net, cur)} before tax, but goods and services received and not yet invoiced on {po['po_number']} come to "
                f"{money(max(received_open, 0), cur)}. Paying now would mean paying for something that has not arrived. "
-               "Confirm delivery with receiving, or pay only the received part.", owner=buyer)
+               "This invoice re-checks itself as soon as a receipt is recorded.", owner=buyer, ask=_receipt_ask(po))
         details.append(d("Goods received", f"billing is {money(round(net - received_open, 2), cur)} ahead of receipts", "fail"))
     else:
         details.append(d("Goods received", "everything billed has been received", "ok"))
+
+    # Is everything on the invoice something this PO actually ordered?
+    po_text = po["description"] + " " + " ".join(l["description"] for l in po["lines"])
+    stray = [li for li in inv["line_items"] if li["description"] and li["amount"] and not _best_po_line(li, po) and similarity(li["description"], po_text) < 0.34]
+    if stray:
+        names = ", ".join(f"'{li['description']}' ({money(li['amount'], cur)})" for li in stray)
+        c.find("amounts", "NOT_ON_PO", HOLD, "Invoice bills for something that is not on the PO",
+               f"{po['po_number']} is for {po['description'].lower()}. It does not cover {names}. Fitting inside the PO's remaining balance is not enough: the PO has to have ordered it.", owner=buyer,
+               ask={"question": f"Was {names} ordered under {po['po_number']}?", "recommend": "Reject, or ask the vendor to quote the right PO.",
+                    "options": [opt("Not ordered, reject", "reject"), FIX, opt("Yes, covered by this PO. Approve", "approve")]})
+        details.append(d("Items not on the PO", names, "fail"))
 
     # Line level: unit prices and quantities, when the invoice is itemised.
     used = _po_line_usage(po, c.run_id)
@@ -608,25 +704,40 @@ def stage_amounts(c: Ctx):
             bad = True
             bits.append(f"price {money(li['unit_price'], cur)} vs {money(line['unit_price'], cur)} on PO ({diff:+.1f}%)")
             c.find("amounts", "PRICE_VARIANCE", HOLD, "Unit price differs from the PO",
-                   f"'{li['description']}' is billed at {money(li['unit_price'], cur)} per unit, the PO agreed {money(line['unit_price'], cur)} ({diff:+.1f}%).", owner=buyer)
+                   f"'{li['description']}' is billed at {money(li['unit_price'], cur)} per unit, the PO agreed {money(line['unit_price'], cur)} ({diff:+.1f}%).", owner=buyer,
+                   ask={"question": f"Did you agree a new price of {money(li['unit_price'], cur)} for '{line['description']}'?", "recommend": "Reject and ask for a corrected invoice unless the price change was agreed.",
+                        "options": [opt("No, reject", "reject"), opt("Yes, price was agreed. Approve", "approve")]})
+        elif abs(diff) > 0.005:
+            bits.append(f"price {diff:+.1f}% vs PO, within tolerance")
+            c.find("amounts", "PRICE_WITHIN_TOLERANCE", INFO, "Small price difference accepted within tolerance",
+                   f"'{li['description']}' is billed at {money(li['unit_price'], cur)}, the PO says {money(line['unit_price'], cur)} ({diff:+.1f}%). Inside the {R['unit_price_tolerance_pct']:g}% tolerance, so it is paid without chasing.")
         else:
             bits.append("price matches PO")
         if li["quantity"] is not None:
             if li["quantity"] > qty_left + 1e-9:
                 bad = True
                 bits.append(f"{li['quantity']:g} billed but only {qty_left:g} of {line['qty']:g} still open on the PO")
-                for f in c.findings:
-                    if f["code"] == "OVER_PO":
-                        f["message"] += f" At line level: {li['quantity']:g} x '{line['description']}' billed, but only {qty_left:g} of the {line['qty']:g} ordered are still un-invoiced."
+                note = f"{li['quantity']:g} x '{line['description']}' billed, but only {qty_left:g} of the {line['qty']:g} ordered are still un-invoiced."
+                existing = [f for f in c.findings if f["code"] == "OVER_PO"]
+                if existing:
+                    existing[0]["message"] += " At line level: " + note
+                elif remaining > 0.005:   # the value fits the PO, but the quantity does not (an exhausted PO already says it all)
+                    c.find("amounts", "QTY_OVER_PO", HOLD, "More units billed than the PO has left", note[0].upper() + note[1:], owner=buyer,
+                           ask={"question": f"Did you order more than {line['qty']:g} x '{line['description']}'?", "recommend": "Dispute the extra units unless the PO was amended.",
+                                "options": [opt("No, reject and dispute", "reject"), opt("Yes, PO was amended. Approve", "approve")]})
             else:
                 bits.append(f"{li['quantity']:g} of {qty_left:g} open units")
             rec_left = line["received"] - used[line["line_no"]]
             if li["quantity"] > rec_left + 1e-9:
                 bad = True
                 bits.append(f"only {rec_left:g} received and not yet invoiced")
-                for f in c.findings:
-                    if f["code"] == "NOT_RECEIVED":
-                        f["message"] += f" At line level: {li['quantity']:g} x '{line['description']}' billed, {rec_left:g} received and not yet invoiced ({line['receipts'] or 'no receipt'})."
+                note = f"{li['quantity']:g} x '{line['description']}' billed, {max(rec_left, 0):g} received and not yet invoiced ({line['receipts'] or 'no receipt'})."
+                existing = [f for f in c.findings if f["code"] == "NOT_RECEIVED"]
+                if existing:
+                    existing[0]["message"] += " At line level: " + note
+                elif remaining > 0.005:
+                    c.find("amounts", "NOT_RECEIVED", HOLD, "Invoice bills for more than has been received",
+                           note[0].upper() + note[1:] + " This invoice re-checks itself as soon as a receipt is recorded.", owner=buyer, ask=_receipt_ask(po))
             else:
                 bits.append(f"received ({line['receipts']})")
         details.append(d(f"Line: {li['description']}", ", ".join(bits), "fail" if bad else "ok"))
@@ -650,6 +761,14 @@ def stage_amounts(c: Ctx):
 def stage_decide(c: Ctx):
     inv = c.inv or {}
     cur = inv.get("currency") or "USD"
+    # "Touchless must be earned": above the limit, a clean invoice still needs a signature.
+    if not c.stop and (inv.get("total") or 0) > R["auto_approve_limit"]:
+        clean = not any(f["severity"] in (HOLD, REJECT) for f in c.findings)
+        c.find("decide", "ABOVE_APPROVAL_LIMIT", HOLD, "Above the automatic approval limit",
+               f"The total {money(inv['total'], cur)} is above the {money(R['auto_approve_limit'], cur)} limit for payment without a signature. "
+               + ("Every other check passed." if clean else "Other checks also failed, see above."), owner="Finance controller",
+               ask={"question": f"Do you approve payment of {money(inv['total'], cur)}?", "recommend": "Approve. Every automated check passed; only the amount needs your sign-off." if clean else "Resolve the other findings first.",
+                    "options": [opt("Approve payment", "approve"), REJECT_IT]})
     rejects = [f for f in c.findings if f["severity"] == REJECT]
     holds = [f for f in c.findings if f["severity"] == HOLD]
     notes = [f for f in c.findings if f["severity"] == INFO]
@@ -683,7 +802,11 @@ def stage_decide(c: Ctx):
         headline, owner = lead["title"], lead["owner"]
         owners = list(dict.fromkeys(f["owner"] for f in rejects + holds))
         if decision == "HOLD":
-            result["next_action"] = f"Routed to {owner} for review. Payment is blocked until someone approves or rejects it in the dashboard."
+            sla = R["hold_sla_hours"]
+            result["next_action"] = f"Waiting on {owner}. Nothing is paid until they answer. If nobody has answered after {sla:g} hours it escalates to the AP manager."
+            result["ask"] = lead.get("ask") or {"question": "Approve this invoice for payment, or reject it?", "recommend": None,
+                                                "options": [opt("Approve for payment", "approve"), REJECT_IT]}
+            result["ask"]["to"] = owner
             body = (f"Invoice {inv_label} from {vendor_name} for {money(inv.get('total'), cur)} is on hold and needs your decision.\n\n"
                     + "\n".join(f"- {f['title']}: {f['message']}" for f in holds)
                     + "\n\nApprove or reject it in Invoice Desk. Nothing will be paid until you do.")
@@ -700,7 +823,10 @@ def stage_decide(c: Ctx):
                         + "\n\nOnce we have a corrected invoice we will process it straight away.\n\nAccounts Payable\nNorthfield Manufacturing Inc.")
                 result["messages"].append({"kind": "vendor", "to": to, "subject": f"Unable to process {ref}", "body": body})
 
+    result["related_run"] = next((f["related"] for f in rejects + holds if f.get("related")), None)
     details = [d("Decision", decision, {"APPROVED": "ok", "HOLD": "warn", "REJECTED": "fail"}[decision]), d("Owner", owner)]
+    if decision == "HOLD":
+        details.append(d("Question asked", result["ask"]["question"], "warn"))
     details += [d("Reason", f["title"], "fail" if f["severity"] == REJECT else "warn") for f in rejects + holds]
     details += [d("Note", f["title"]) for f in notes]
 
@@ -718,9 +844,18 @@ def stage_decide(c: Ctx):
 
 
 # --- Runner ----------------------------------------------------------------------
-def run_pipeline(run_id, data, filename, mime, override=None, corrections=None):
+# Only one invoice at a time may check history and PO balances and commit its decision.
+# Without this, two invoices arriving together could both draw on the same PO balance.
+# (One process, one lock. Several servers would need this in the database instead.)
+_decision_lock = threading.Lock()
+LOCKED_STAGES = ("duplicate", "po_match", "amounts", "decide")
+
+
+def run_pipeline(run_id, data, filename, mime, override=None, corrections=None, pace=True, carry=None):
     started = time.perf_counter()
     c = Ctx(run_id, data, filename, mime, override, corrections)
+    c.carry = carry or []
+    locked = False
     pool = ThreadPoolExecutor(max_workers=1)
     if override is None:
         # Start the slow step (the AI read) immediately, so it overlaps with intake.
@@ -731,6 +866,9 @@ def run_pipeline(run_id, data, filename, mime, override=None, corrections=None):
         db.upsert_stage(run_id, seq, key, title, "pending")
     try:
         for seq, (key, title) in enumerate(STAGES, 1):
+            if key in LOCKED_STAGES and not locked:
+                _decision_lock.acquire()
+                locked = True
             if key != "decide" and c.stop:
                 db.upsert_stage(run_id, seq, key, title, SKIP, f"Skipped because {c.stop}")
                 continue
@@ -744,7 +882,7 @@ def run_pipeline(run_id, data, filename, mime, override=None, corrections=None):
             if key == "extract" and c.meta.get("ms") is not None:
                 ms = c.meta["ms"]   # true read time, including the part that overlapped intake
             pause = config.STAGE_PACING_MS / 1000 - (time.perf_counter() - t0)
-            if pause > 0:
+            if pause > 0 and pace:
                 time.sleep(pause)
             db.upsert_stage(run_id, seq, key, title, status, summary, details, ms)
         db.update_run(run_id, status="done", duration_ms=int((time.perf_counter() - started) * 1000))
@@ -757,7 +895,13 @@ def run_pipeline(run_id, data, filename, mime, override=None, corrections=None):
                               "next_action": "The process failed on this document. Handle it manually and report the error."},
                       duration_ms=int((time.perf_counter() - started) * 1000))
     finally:
+        if locked:
+            _decision_lock.release()
         pool.shutdown(wait=False)
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def review(run_id, action, reviewer, note):
@@ -768,7 +912,7 @@ def review(run_id, action, reviewer, note):
     final = "APPROVED" if action == "approve" else "REJECTED"
     db.update_run(run_id, final_state=final, review={
         "action": action, "reviewer": reviewer or "Reviewer", "note": note or "",
-        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "at": now(),
     })
     return db.get_run(run_id)
 
@@ -793,9 +937,63 @@ def rerun(run_id, fields, reviewer, note):
     changes = [{"field": EDITABLE[k], "from": base[k], "to": proposed[k]} for k in EDITABLE if base[k] != proposed[k]]
     if not changes:
         return "Nothing was changed"
-    corrections = (run["corrections"] or []) + [{"by": reviewer, "note": note, "at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "changes": changes}]
+    corrections = (run["corrections"] or []) + [{"kind": "correction", "by": reviewer, "note": note, "at": now(), "changes": changes}]
     db.clear_stages(run_id)
     db.update_run(run_id, status="running", decision=None, final_state=None, headline=None, owner=None, findings=None, result=None, corrections=corrections)
     data = Path(f["file_path"]).read_bytes()
     threading.Thread(target=run_pipeline, args=(run_id, data, run["filename"], run["mime"], proposed, corrections), daemon=True).start()
     return None
+
+
+def _reevaluate(run, event, pace=False):
+    """Run the rules again on what was already read. The document is not re-read."""
+    f = db.run_file(run["id"])
+    path = Path(f["file_path"]) if f and f["file_path"] else None
+    data = path.read_bytes() if path and path.is_file() else run["id"].encode()
+    events = (run["corrections"] or []) + [event]
+    carry = [x for x in (run["findings"] or []) if x["stage"] == "extract"]
+    db.clear_stages(run["id"])
+    db.update_run(run["id"], status="running", decision=None, final_state=None, headline=None, owner=None, findings=None, result=None, corrections=events)
+    run_pipeline(run["id"], data, run["filename"], run["mime"], normalise(run["extraction"]), events, pace, carry)
+    if not pace:   # a silent re-check takes milliseconds; keep the time the invoice originally took
+        db.update_run(run["id"], duration_ms=run["duration_ms"])
+
+
+def recheck_holds(reason):
+    """Something changed (a receipt, a rule, a learned name): held invoices resume by themselves.
+
+    Each open hold is re-evaluated in the background. If nothing about it changed, no trace is left.
+    """
+    def work():
+        for run in db.open_holds():
+            before = sorted(f["code"] for f in run["findings"] or [])
+            _reevaluate(run, {"kind": "recheck", "by": "Invoice Desk", "note": reason, "at": now(), "changes": []})
+            after = db.get_run(run["id"], with_stages=False)
+            if after["final_state"] == "HOLD" and sorted(f["code"] for f in after["findings"] or []) == before:
+                db.update_run(run["id"], corrections=run["corrections"] or [])
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    return t
+
+
+def answer(run_id, index, reviewer):
+    """A person answers the question a hold asked. Returns (run, error)."""
+    run = db.get_run(run_id, with_stages=False)
+    if not run or run["final_state"] != "HOLD" or run["review"] or run["status"] != "done":
+        return None, "This invoice is not waiting for an answer"
+    ask = (run["result"] or {}).get("ask") or {}
+    if not 0 <= index < len(ask.get("options", [])):
+        return None, "Unknown answer"
+    choice = ask["options"][index]
+    note = f"{ask['question']} Answer: {choice['label']}"
+    if choice["action"] in ("approve", "reject"):
+        return review(run_id, choice["action"], reviewer, note), None
+    if choice["action"] == "learn_alias":
+        name = (run["extraction"] or {}).get("vendor_name")
+        db.add_alias(run["vendor_id"], name, reviewer, run_id, now())
+        def work():
+            _reevaluate(run, {"kind": "answer", "by": reviewer, "note": note, "at": now(), "changes": []}, pace=True)
+            recheck_holds(f"{reviewer} confirmed '{name}' as a vendor name").join()
+        threading.Thread(target=work, daemon=True).start()
+        return db.get_run(run_id), None
+    return None, "That answer is given elsewhere on the page"

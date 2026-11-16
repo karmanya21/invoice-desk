@@ -27,6 +27,8 @@ SAMPLE_INFO = {
     "05_reissued_duplicate.pdf": ("Reissued duplicate", "Same invoice as the happy path with a new number. Run after it.", "HOLD"),
     "06_lookalike_vendor_new_bank.pdf": ("Look-alike vendor", "Near-identical vendor name, different tax ID and bank account.", "HOLD"),
     "07_missing_invoice_number.pdf": ("Missing information", "No invoice number and no date on the document.", "REJECTED"),
+    "08_billed_before_receipt.pdf": ("Billed before delivery", "Two months billed, one confirmed. Clears itself when the receipt is recorded.", "HOLD"),
+    "09_trading_name.pdf": ("Unfamiliar vendor name", "Known vendor billing under a trading name. Answer once and it is remembered.", "HOLD"),
 }
 
 
@@ -135,6 +137,64 @@ def review(run_id: str, body: Review):
     return r
 
 
+class Answer(BaseModel):
+    index: int
+    reviewer: str = ""
+
+
+@app.post("/api/runs/{run_id}/answer")
+def answer(run_id: str, body: Answer):
+    if not body.reviewer.strip():
+        raise HTTPException(400, "Add your name, it is kept with the answer for audit")
+    run, problem = pipeline.answer(run_id, body.index, body.reviewer.strip())
+    if problem:
+        raise HTTPException(409, problem)
+    return run
+
+
+class Receipt(BaseModel):
+    po_number: str
+    line_no: int
+    qty: float
+    by: str = ""
+
+
+@app.post("/api/receipts")
+def record_receipt(body: Receipt):
+    """Receiving books goods in. Any invoice held for missing receipts re-checks itself."""
+    po = db.purchase_order(body.po_number)
+    line = next((l for l in (po or {}).get("lines", []) if l["line_no"] == body.line_no), None)
+    if not line or body.qty <= 0 or not body.by.strip():
+        raise HTTPException(400, "Choose a PO line, a quantity above zero, and add your name")
+    if line["received"] + body.qty > line["qty"] + 1e-9:
+        raise HTTPException(400, f"Only {line['qty'] - line['received']:g} of this line is still outstanding")
+    receipt_no = "GRN-" + uuid.uuid4().hex[:4].upper()
+    db.add_receipt(body.po_number, body.line_no, body.qty, datetime.now(timezone.utc).date().isoformat(), receipt_no)
+    pipeline.recheck_holds(f"receipt {receipt_no} recorded by {body.by.strip()}: {body.qty:g} x '{line['description']}' on {body.po_number}")
+    return {"receipt_no": receipt_no}
+
+
+class RuleChange(BaseModel):
+    key: str
+    value: float
+    by: str = ""
+
+
+@app.put("/api/rules")
+def change_rule(body: RuleChange):
+    """The process owner changes a threshold. No deploy, and held invoices are re-checked against it."""
+    meta = config.EDITABLE_RULES.get(body.key)
+    if not meta or not body.by.strip():
+        raise HTTPException(400, "Choose a rule and add your name")
+    label, unit, lo, hi = meta
+    if not lo <= body.value <= hi:
+        raise HTTPException(400, f"{label} must be between {lo:g} and {hi:g}")
+    old = db.set_rule(body.key, body.value, body.by.strip(), pipeline.now())
+    if old != body.value:
+        pipeline.recheck_holds(f"rule changed by {body.by.strip()}: {label} {old:g} to {body.value:g}")
+    return {"ok": True}
+
+
 class Rerun(BaseModel):
     fields: dict
     reviewer: str = ""
@@ -156,7 +216,8 @@ def stats():
     rs = [r for r in db.list_runs() if r["status"] != "running"]
     n = len(rs)
     by = lambda key, val: [r for r in rs if r[key] == val]
-    auto = [r for r in by("decision", "APPROVED") if not r["corrections"]]   # corrected by a person is not touchless
+    touched = lambda r: any(e.get("kind", "correction") != "recheck" for e in r["corrections"] or [])
+    auto = [r for r in by("decision", "APPROVED") if not touched(r)]   # corrected or answered by a person is not touchless
     waiting = by("final_state", "HOLD")
     stopped = [r for r in rs if r["decision"] != "APPROVED" and r["final_state"] != "APPROVED"]
     cleared = by("final_state", "APPROVED")
@@ -175,7 +236,9 @@ def stats():
         "manual_minutes": n * imp["manual_minutes_per_invoice"],
         "impact": imp,
         "reasons": sorted(reasons.values(), key=lambda g: -g["value"]),
-        "corrected": len([r for r in rs if r["corrections"]]),
+        "corrected": len([r for r in rs if touched(r)]),
+        "resumed": len([r for r in rs if any(e.get("kind") == "recheck" for e in r["corrections"] or [])]),
+        "sla_hours": config.RULES["hold_sla_hours"],
         "processed": n,
         "auto_approved": len(auto),
         "touchless_rate": round(len(auto) / n * 100) if n else 0,
@@ -191,7 +254,9 @@ def stats():
 
 @app.get("/api/reference")
 def reference():
-    return {"vendors": db.vendors(), "purchase_orders": db.purchase_orders(), "rules": config.RULES, "impact": config.IMPACT}
+    return {"vendors": db.vendors(), "purchase_orders": db.purchase_orders(), "rules": config.RULES, "impact": config.IMPACT,
+            "editable": {k: {"label": v[0], "unit": v[1], "min": v[2], "max": v[3], "default": config.DEFAULT_RULES[k]} for k, v in config.EDITABLE_RULES.items()},
+            "rule_changes": db.rule_changes(), "learned": db.learned()}
 
 
 @app.post("/api/reset")

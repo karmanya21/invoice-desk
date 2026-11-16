@@ -277,10 +277,22 @@ SAMPLES = [
     ("07_missing_invoice_number.pdf", layout_statement, dict(
         vendor="Orchid Facilities Management", vendor_address="77 Greenway Plaza, Evanston, IL 60201", tax_id="58-6621907", bank_last4="3059",
         po="PO-4521", tax_rate=8, lines=[("Janitorial services - November", 1, 3200.00)])),
+    ("08_billed_before_receipt.pdf", layout_modern, dict(
+        vendor="Kestrel Logistics Inc.", vendor_address="4 Harbor Gate, Gary, IN 46402", tax_id="36-7704112", bank_last4="1185",
+        number="KL/2026/1203", date="2026-11-10", due="2026-12-10", po="PO-4503", tax_rate=8,
+        lines=[("Warehouse pallet storage - monthly (October, November)", 2, 4000.00)], footer="Storage billed monthly in arrears.")),
+    ("09_trading_name.pdf", layout_classic, dict(
+        vendor="BW Hosting", vendor_address="900 Data Park Way, Columbus, OH 43215", tax_id="91-3348820", bank_last4="6672",
+        number="BWH-1042", date="2026-11-05", due="2026-12-05", po="PO-4515", tax_rate=0,
+        lines=[("Managed cloud hosting - monthly", 1, 1950.00)])),
 ]
 
 if __name__ == "__main__":
     OUT.mkdir(exist_ok=True)
+    import sys
+    only = sys.argv[1:]   # optional: file-name prefixes to (re)generate, e.g. 08 09
     for name, fn, data in SAMPLES:
+        if only and not name.startswith(tuple(only)):
+            continue
         fn(OUT / name, data)
         print("wrote", name)

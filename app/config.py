@@ -47,6 +47,22 @@ RULES = {
     "implied_po_min_margin": 0.20,
     # Invoices dated in the future or older than this are suspicious.
     "max_invoice_age_days": 180,
+    # Even a perfectly clean invoice above this total needs a person to sign it off.
+    "auto_approve_limit": 50000.00,
+    # A hold nobody has answered after this long escalates to the AP manager.
+    "hold_sla_hours": 48,
+}
+DEFAULT_RULES = dict(RULES)
+
+# Rules the process owner may change from the UI, without a developer: key -> (label, unit, min, max).
+EDITABLE_RULES = {
+    "tolerance_pct": ("Amount tolerance, % of PO", "%", 0, 20),
+    "tolerance_abs": ("Amount tolerance, cap", "$", 0, 100000),
+    "unit_price_tolerance_pct": ("Unit price tolerance", "%", 0, 20),
+    "near_duplicate_window_days": ("Probable-duplicate window", "days", 0, 90),
+    "implied_po_auto_limit": ("Inferred-PO auto-approval limit", "$", 0, 10000000),
+    "auto_approve_limit": ("Automatic approval limit", "$", 0, 100000000),
+    "hold_sla_hours": ("Hold escalates after", "hours", 1, 720),
 }
 
 # Minimum time a stage stays on screen in the live view. The real compute time

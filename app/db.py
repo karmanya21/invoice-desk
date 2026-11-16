@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS po_lines (
 CREATE TABLE IF NOT EXISTS goods_receipts (
     po_number TEXT, line_no INTEGER, qty REAL, received_date TEXT, receipt_no TEXT
 );
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value REAL);
+CREATE TABLE IF NOT EXISTS rule_changes (at TEXT, by TEXT, key TEXT, old REAL, new REAL);
+CREATE TABLE IF NOT EXISTS learned (at TEXT, by TEXT, what TEXT, run_id TEXT);
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY, created_at TEXT, filename TEXT, file_hash TEXT, file_path TEXT, mime TEXT,
     status TEXT,            -- running | done | error
@@ -62,6 +65,9 @@ def init():
         c.executescript(SCHEMA)
         if c.execute("SELECT COUNT(*) FROM vendors").fetchone()[0] == 0:
             _seed(c)
+        for row in c.execute("SELECT key, value FROM settings"):   # rules changed from the UI survive a restart
+            if row["key"] in config.RULES:
+                config.RULES[row["key"]] = row["value"]
 
 
 def _seed(c):
@@ -84,9 +90,10 @@ def _seed(c):
 def reset():
     """Wipe all runs and restore the reference data to its starting state."""
     with connect() as c:
-        for t in ("stages", "runs", "goods_receipts", "po_lines", "purchase_orders", "vendors"):
+        for t in ("stages", "runs", "goods_receipts", "po_lines", "purchase_orders", "vendors", "settings", "rule_changes", "learned"):
             c.execute(f"DELETE FROM {t}")
         _seed(c)
+    config.RULES.update(config.DEFAULT_RULES)
     if config.UPLOAD_DIR.exists():
         shutil.rmtree(config.UPLOAD_DIR)
     config.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -203,6 +210,48 @@ def runs_with_hash(file_hash, exclude_run):
             (file_hash, exclude_run),
         ).fetchall()
     return [_run_dict(r) for r in rows]
+
+
+def open_holds():
+    """Invoices waiting for a person, oldest first, that the process was able to read."""
+    with connect() as c:
+        rows = c.execute("SELECT * FROM runs WHERE final_state='HOLD' AND status='done' AND review IS NULL AND extraction IS NOT NULL ORDER BY created_at").fetchall()
+    return [_run_dict(r) for r in rows]
+
+
+# --- things people change: rules, receipts, what the process has learned -----------
+def set_rule(key, value, by, at):
+    old = config.RULES[key]
+    config.RULES[key] = value
+    with connect() as c:
+        c.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, value))
+        c.execute("INSERT INTO rule_changes VALUES (?,?,?,?,?)", (at, by, key, old, value))
+    return old
+
+
+def rule_changes():
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM rule_changes ORDER BY at DESC")]
+
+
+def add_receipt(po_number, line_no, qty, received_date, receipt_no):
+    with connect() as c:
+        c.execute("INSERT INTO goods_receipts VALUES (?,?,?,?,?)", (po_number, line_no, qty, received_date, receipt_no))
+
+
+def add_alias(vendor_id, name, by, run_id, at):
+    with connect() as c:
+        row = c.execute("SELECT name, aliases FROM vendors WHERE id=?", (vendor_id,)).fetchone()
+        aliases = json.loads(row["aliases"] or "[]")
+        if name not in aliases:
+            aliases.append(name)
+            c.execute("UPDATE vendors SET aliases=? WHERE id=?", (json.dumps(aliases), vendor_id))
+            c.execute("INSERT INTO learned VALUES (?,?,?,?)", (at, by, f"'{name}' is another name for {row['name']} ({vendor_id})", run_id))
+
+
+def learned():
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM learned ORDER BY at DESC")]
 
 
 def clear_stages(run_id):
