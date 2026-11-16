@@ -13,6 +13,9 @@ import base64
 import io
 import json
 import re
+import time
+
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import httpx
 from pypdf import PdfReader
@@ -126,37 +129,70 @@ def _call(client, model, data, mime, thinking_off):
     return client.post(url, json=body, headers={"x-goog-api-key": config.GEMINI_API_KEY})
 
 
-def gemini_extract(data: bytes, mime: str) -> tuple[dict, str]:
-    last_error = "no model configured"
+def _read(model, data, mime) -> dict:
+    """One model reads the document once. Raises ExtractionError with the reason on any failure."""
+    try:
+        with httpx.Client(timeout=httpx.Timeout(config.GEMINI_TIMEOUT_S, connect=5)) as client:
+            r = _call(client, model, data, mime, thinking_off=True)
+            if r.status_code == 400:  # some models reject the thinking setting
+                r = _call(client, model, data, mime, thinking_off=False)
+    except httpx.HTTPError as e:
+        raise ExtractionError(f"{model}: no answer within {config.GEMINI_TIMEOUT_S:g} s ({type(e).__name__})")
+    if r.status_code != 200:
+        try:
+            msg = r.json().get("error", {}).get("message", "")[:160]
+        except Exception:
+            msg = r.text[:160]
+        raise ExtractionError(f"{model}: HTTP {r.status_code} {msg}")
+    try:
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
+        parsed = json.loads(text)
+        return normalise(parsed[0] if isinstance(parsed, list) else parsed)
+    except Exception as e:
+        raise ExtractionError(f"{model}: unreadable response ({type(e).__name__})")
+
+
+def gemini_extract(data: bytes, mime: str, want_second: bool = False):
+    """Ask two models at the same time.
+
+    - Digital PDF: take whichever answers first (one slow or overloaded model no
+      longer stalls the run). The answer is cross-checked against the PDF text later.
+    - Scan (want_second): wait for both, so the two independent reads can be compared.
+
+    Returns (fields, model, second_fields_or_None, second_model_or_None).
+    """
     models = _preferred + [m for m in config.GEMINI_MODELS if m not in _preferred]
-    timeout = httpx.Timeout(config.GEMINI_TIMEOUT_S, connect=5)
-    with httpx.Client(timeout=timeout) as client:
-        for model in models:
-            try:
-                r = _call(client, model, data, mime, thinking_off=True)
-                if r.status_code == 400:  # some models reject the thinking setting
-                    r = _call(client, model, data, mime, thinking_off=False)
-            except httpx.HTTPError as e:
-                last_error = f"{model}: no answer within {config.GEMINI_TIMEOUT_S:g} s ({type(e).__name__})"
-                continue
-            if r.status_code != 200:
+    if not models:
+        raise ExtractionError("no model configured")
+    errors, good, deadline = [], [], None   # good: [(model, fields)] in order of arrival
+    pool = ThreadPoolExecutor(max_workers=2)
+    try:
+        queue = list(models)
+        running = {}
+        while (queue or running) and len(good) < (2 if want_second else 1):
+            while queue and len(running) < 2:
+                m = queue.pop(0)
+                running[pool.submit(_read, m, data, mime)] = m
+            # Once one read is in, the second opinion gets a short grace period, not the full timeout.
+            left = None if deadline is None else max(0.0, deadline - time.perf_counter())
+            done, _ = wait(running, timeout=left, return_when=FIRST_COMPLETED)
+            if not done:
+                break
+            for fut in done:
+                m = running.pop(fut)
                 try:
-                    msg = r.json().get("error", {}).get("message", "")[:160]
-                except Exception:
-                    msg = r.text[:160]
-                last_error = f"{model}: HTTP {r.status_code} {msg}"
-                continue  # busy, over quota or unknown model: try the next one
-            try:
-                text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-                text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
-                parsed = json.loads(text)
-                if isinstance(parsed, list):
-                    parsed = parsed[0]
-                _preferred[:] = [model]
-                return normalise(parsed), model
-            except Exception as e:
-                last_error = f"{model}: unreadable response ({type(e).__name__})"
-    raise ExtractionError(last_error)
+                    good.append((m, fut.result()))
+                    deadline = deadline or time.perf_counter() + config.SECOND_READ_GRACE_S
+                except ExtractionError as e:
+                    errors.append(str(e))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    if not good:
+        raise ExtractionError("; ".join(errors) or "no model answered")
+    _preferred[:] = [m for m, _ in good]
+    (model, fields), second = good[0], (good[1] if len(good) > 1 else (None, None))
+    return fields, model, second[1], second[0]
 
 
 # --- Extractor 2: offline text parser -----------------------------------------
@@ -215,12 +251,17 @@ def text_extract(text: str) -> dict:
 
 # --- Orchestration --------------------------------------------------------------
 def extract(data: bytes, mime: str, text: str) -> tuple[dict, dict]:
-    """Return (fields, meta). meta says which extractor ran and why."""
-    meta = {"extractor": None, "model": None, "fallback_reason": None}
+    """Return (fields, meta). meta says which extractor ran, how long it took and why."""
+    started = time.perf_counter()
+    meta = {"extractor": None, "model": None, "fallback_reason": None, "second": None, "second_model": None, "second_wanted": False}
+    done = lambda: meta.update(ms=int((time.perf_counter() - started) * 1000))
     if config.GEMINI_API_KEY:
         try:
-            fields, model = gemini_extract(data, mime)
-            meta.update(extractor="gemini", model=model)
+            # A scan has no text layer to check the model against, so get two independent reads.
+            meta["second_wanted"] = not text
+            fields, model, second, second_model = gemini_extract(data, mime, want_second=not text)
+            meta.update(extractor="gemini", model=model, second=second, second_model=second_model)
+            done()
             return fields, meta
         except ExtractionError as e:
             meta["fallback_reason"] = f"AI model unavailable ({e})"
@@ -229,7 +270,9 @@ def extract(data: bytes, mime: str, text: str) -> tuple[dict, dict]:
 
     if text:
         meta["extractor"] = "text-parser"
-        return text_extract(text), meta
+        fields = text_extract(text)
+        done()
+        return fields, meta
     raise ExtractionError(
         f"{meta['fallback_reason']}. This document is a scanned image with no text layer, "
         "so the offline parser cannot read it."

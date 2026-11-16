@@ -135,17 +135,47 @@ def review(run_id: str, body: Review):
     return r
 
 
+class Rerun(BaseModel):
+    fields: dict
+    reviewer: str = ""
+    note: str = ""
+
+
+@app.post("/api/runs/{run_id}/rerun")
+def rerun(run_id: str, body: Rerun):
+    if not body.reviewer.strip() or not body.note.strip():
+        raise HTTPException(400, "A name and a reason are required, both are kept for audit")
+    problem = pipeline.rerun(run_id, body.fields, body.reviewer.strip(), body.note.strip())
+    if problem:
+        raise HTTPException(409, problem)
+    return {"id": run_id}
+
+
 @app.get("/api/stats")
 def stats():
     rs = [r for r in db.list_runs() if r["status"] != "running"]
     n = len(rs)
     by = lambda key, val: [r for r in rs if r[key] == val]
-    auto = by("decision", "APPROVED")
+    auto = [r for r in by("decision", "APPROVED") if not r["corrections"]]   # corrected by a person is not touchless
     waiting = by("final_state", "HOLD")
     stopped = [r for r in rs if r["decision"] != "APPROVED" and r["final_state"] != "APPROVED"]
     cleared = by("final_state", "APPROVED")
     total = lambda xs: round(sum(r["total_amount"] or 0 for r in xs), 2)
+    imp = config.IMPACT
+    held_n = len(by("decision", "HOLD"))
+    saved = n * imp["manual_minutes_per_invoice"] - held_n * imp["review_minutes_per_hold"]
+    reasons = {}
+    for r in rs:
+        if r["decision"] != "APPROVED":
+            g = reasons.setdefault((r["decision"], r["headline"]), {"outcome": r["decision"], "reason": r["headline"], "owner": r["owner"], "count": 0, "value": 0.0})
+            g["count"] += 1
+            g["value"] = round(g["value"] + (r["total_amount"] or 0), 2)
     return {
+        "minutes_saved": max(saved, 0),
+        "manual_minutes": n * imp["manual_minutes_per_invoice"],
+        "impact": imp,
+        "reasons": sorted(reasons.values(), key=lambda g: -g["value"]),
+        "corrected": len([r for r in rs if r["corrections"]]),
         "processed": n,
         "auto_approved": len(auto),
         "touchless_rate": round(len(auto) / n * 100) if n else 0,
@@ -161,7 +191,7 @@ def stats():
 
 @app.get("/api/reference")
 def reference():
-    return {"vendors": db.vendors(), "purchase_orders": db.purchase_orders(), "rules": config.RULES}
+    return {"vendors": db.vendors(), "purchase_orders": db.purchase_orders(), "rules": config.RULES, "impact": config.IMPACT}
 
 
 @app.post("/api/reset")

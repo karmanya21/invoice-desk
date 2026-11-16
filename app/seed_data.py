@@ -36,3 +36,14 @@ PURCHASE_ORDERS = [
      "currency": "USD", "tax_rate": 8.0, "buyer": "Daniel Okafor", "issued_date": "2026-10-28",
      "lines": [("Janitorial services - November", 1, 3200.00)]},
 ]
+
+# Goods received / services confirmed against each PO line: (po, line_no, qty, date, receipt no).
+# This is the third leg of the 3-way match: we only pay for what has actually arrived.
+GOODS_RECEIPTS = [
+    ("PO-4471", 1, 25, "2026-10-29", "GRN-3301"), ("PO-4471", 2, 10, "2026-10-29", "GRN-3301"), ("PO-4471", 3, 25, "2026-10-30", "GRN-3304"),
+    ("PO-4480", 1, 10, "2026-10-18", "GRN-3288"), ("PO-4480", 1, 6, "2026-11-08", "GRN-3340"),
+    ("PO-4502", 1, 1, "2026-10-31", "SVC-0912"),
+    ("PO-4503", 1, 1, "2026-10-31", "SVC-0913"),
+    ("PO-4515", 1, 10, "2026-11-01", "SVC-0920"),
+    ("PO-4521", 1, 1, "2026-11-14", "SVC-0931"),
+]

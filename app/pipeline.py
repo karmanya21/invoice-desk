@@ -6,7 +6,7 @@
     4 vendor      is this really one of our approved vendors?
     5 duplicate   have we seen this invoice before?
     6 po_match    find the purchase order (stated on the invoice, or inferred)
-    7 amounts     compare against what is LEFT on the PO, within tolerance
+    7 amounts     3-way match: what is LEFT on the PO and what has been RECEIVED
     8 decide      APPROVED / HOLD / REJECTED, with reasons, owner and next step
 
 Every stage records what it checked and what it found. Stages do not stop at the
@@ -15,13 +15,16 @@ The decision is simply the most severe finding.
 """
 import hashlib
 import re
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
+from pathlib import Path
 from difflib import SequenceMatcher
 
 from . import config, db
-from .extract import ExtractionError, extract, pdf_text
+from .extract import ExtractionError, extract, normalise, pdf_text
 
 R = config.RULES
 
@@ -32,7 +35,7 @@ STAGES = [
     ("vendor", "Verify vendor"),
     ("duplicate", "Check for duplicates"),
     ("po_match", "Match purchase order"),
-    ("amounts", "Check amounts against PO balance"),
+    ("amounts", "3-way match: PO balance and goods received"),
     ("decide", "Decide and route"),
 ]
 
@@ -102,10 +105,14 @@ def d(label, value, status=None):
 class Ctx:
     """Everything known about one run as it moves through the stages."""
 
-    def __init__(self, run_id, data, filename, mime):
+    def __init__(self, run_id, data, filename, mime, override=None, corrections=None):
         self.run_id, self.data, self.filename, self.mime = run_id, data, filename, mime
         self.findings = []
-        self.text = ""
+        self.override = override          # fields corrected by a person: skip the AI read
+        self.corrections = corrections or []
+        self.future = None                # the AI read, started the moment the file arrives
+        self.file_hash = hashlib.sha256(data).hexdigest()
+        self.text, self.pages = pdf_text(data) if mime == "application/pdf" else ("", 1)
         self.inv = None          # extracted fields
         self.meta = {}
         self.net = None          # amount before tax, the figure compared to the PO
@@ -126,10 +133,7 @@ class Ctx:
 
 # --- Stage 1: intake -------------------------------------------------------------
 def stage_intake(c: Ctx):
-    c.file_hash = hashlib.sha256(c.data).hexdigest()
-    pages = 1
-    if c.mime == "application/pdf":
-        c.text, pages = pdf_text(c.data)
+    pages = c.pages or 1
     kind = "Digital PDF (machine-readable text)" if c.text else ("Scanned PDF (image only, no text layer)" if c.mime == "application/pdf" else "Image file")
     details = [
         d("File", c.filename),
@@ -143,27 +147,64 @@ def stage_intake(c: Ctx):
 
 
 # --- Stage 2: extract ------------------------------------------------------------
-def stage_extract(c: Ctx):
-    try:
-        c.inv, c.meta = extract(c.data, c.mime, c.text)
-    except ExtractionError as e:
-        c.find("extract", "UNREADABLE", HOLD, "Document could not be read automatically",
-               f"{e} Key this invoice manually or re-run once the model is available.")
-        c.stop = "the invoice could not be read"
-        return FAIL, "Could not read the document", [d("Reason", str(e), "fail")]
+READ_CHECKS = [
+    ("vendor name", "vendor_name", norm_vendor), ("vendor tax ID", "vendor_tax_id", digits),
+    ("invoice number", "invoice_number", norm_invoice_no), ("invoice date", "invoice_date", lambda v: v or ""),
+    ("PO number", "po_number", digits), ("total", "total", lambda v: v),
+    ("pay-to account", "bank_account", lambda v: digits(v)[-4:]),
+]
 
+
+def read_differences(a, b):
+    """Fields where two independent reads of the same document disagree."""
+    return [f"{label}: '{a[k] if a[k] is not None else 'nothing'}' vs '{b[k] if b[k] is not None else 'nothing'}'"
+            for label, k, norm in READ_CHECKS if norm(a.get(k)) != norm(b.get(k))]
+
+
+def stage_extract(c: Ctx):
+    if c.override is not None:
+        last = c.corrections[-1]
+        c.inv, c.meta = c.override, {"extractor": "corrected"}
+        details = [d("Read by", f"Earlier read, corrected by {last['by']}")]
+        details += [d(f"Corrected: {ch['field']}", f"{ch['from'] if ch['from'] is not None else 'nothing'} changed to {ch['to'] if ch['to'] is not None else 'nothing'}", "warn") for ch in last["changes"]]
+        details.append(d("Reason given", last["note"]))
+        db.update_run(c.run_id, extraction=c.inv)
+    else:
+        try:
+            c.inv, c.meta = c.future.result()
+        except ExtractionError as e:
+            c.find("extract", "UNREADABLE", HOLD, "Document could not be read automatically",
+                   f"{e} Key the fields in by hand below, or re-run once the model is available.")
+            c.stop = "the invoice could not be read"
+            return FAIL, "Could not read the document", [d("Reason", str(e), "fail")]
+        extractor = f"Gemini vision model ({c.meta['model']})" if c.meta["extractor"] == "gemini" else "Offline text parser"
+        details = [d("Read by", extractor)]
+        if c.meta.get("fallback_reason"):
+            details.append(d("Why not the AI model", c.meta["fallback_reason"], "warn"))
+        db.update_run(c.run_id, extractor=c.meta["extractor"], extraction=c.inv)
     inv, meta = c.inv, c.meta
-    extractor = f"Gemini vision model ({meta['model']})" if meta["extractor"] == "gemini" else "Offline text parser"
-    details = [d("Read by", extractor)]
-    if meta.get("fallback_reason"):
-        details.append(d("Why not the AI model", meta["fallback_reason"], "warn"))
-    db.update_run(c.run_id, extractor=meta["extractor"], extraction=inv)
 
     if not inv["is_invoice"]:
         c.find("extract", "NOT_AN_INVOICE", HOLD, "This does not look like an invoice",
                "The document was read but is not a request for payment. Check what was sent and file or discard it.")
         c.stop = "the document is not an invoice"
         return FAIL, "Document is not an invoice", details
+
+    # A scan has no text layer to check against, so two models read it independently.
+    # If they disagree on anything that affects payment, a person looks at it.
+    if meta.get("second"):
+        diffs = read_differences(inv, meta["second"])
+        if diffs:
+            c.find("extract", "READ_DISAGREEMENT", HOLD, "Two independent reads of this scan disagree",
+                   f"{meta['model']} and {meta['second_model']} read the scan differently: " + "; ".join(diffs)
+                   + ". Check the document and correct the fields below before it can be paid.")
+            details.append(d(f"Second read ({meta['second_model']})", "disagrees on " + "; ".join(diffs), "fail"))
+        else:
+            details.append(d(f"Second read ({meta['second_model']})", "agrees on vendor, invoice number, date, PO, total and pay-to account", "ok"))
+    elif meta.get("second_wanted"):
+        c.find("extract", "READ_UNCONFIRMED", INFO, "Scan was read by one model only",
+               "A second model normally re-reads scanned invoices as a cross-check, but it was unavailable. The single read still had to pass every rule below.")
+        details.append(d("Second read", "unavailable, single read used", "warn"))
 
     cur = inv["currency"]
     shown = [
@@ -199,7 +240,7 @@ def stage_extract(c: Ctx):
             details.append(d("Cross-check against PDF text", "invoice number and total both appear verbatim", "ok"))
 
     found = sum(1 for _, v in shown if v)
-    return c.worst("extract"), f"Read {found} of {len(shown)} header fields and {n} line item{'s' if n != 1 else ''}", details
+    return (c.worst("extract") if c.override is None else WARN if c.worst("extract") == WARN else OK), f"Read {found} of {len(shown)} header fields and {n} line item{'s' if n != 1 else ''}", details
 
 
 # --- Stage 3: validate -----------------------------------------------------------
@@ -541,6 +582,19 @@ def stage_amounts(c: Ctx):
         else:
             details.append(d("Result", "invoice fully consumes the PO", "ok"))
 
+    # Third leg of the match: has what is being billed actually arrived?
+    received_open = round(po["received_value"] - po["invoiced"], 2)
+    details.append(d("Received, not yet invoiced", f"{money(received_open, cur)} ({money(po['received_value'], cur)} received in total)"))
+    not_received = remaining > 0.005 and net > received_open + tol   # an exhausted PO is already reported above
+    if not_received:
+        c.find("amounts", "NOT_RECEIVED", HOLD, "Invoice bills for more than has been received",
+               f"Invoice is {money(net, cur)} before tax, but goods and services received and not yet invoiced on {po['po_number']} come to "
+               f"{money(max(received_open, 0), cur)}. Paying now would mean paying for something that has not arrived. "
+               "Confirm delivery with receiving, or pay only the received part.", owner=buyer)
+        details.append(d("Goods received", f"billing is {money(round(net - received_open, 2), cur)} ahead of receipts", "fail"))
+    else:
+        details.append(d("Goods received", "everything billed has been received", "ok"))
+
     # Line level: unit prices and quantities, when the invoice is itemised.
     used = _po_line_usage(po, c.run_id)
     for li in inv["line_items"]:
@@ -566,6 +620,15 @@ def stage_amounts(c: Ctx):
                         f["message"] += f" At line level: {li['quantity']:g} x '{line['description']}' billed, but only {qty_left:g} of the {line['qty']:g} ordered are still un-invoiced."
             else:
                 bits.append(f"{li['quantity']:g} of {qty_left:g} open units")
+            rec_left = line["received"] - used[line["line_no"]]
+            if li["quantity"] > rec_left + 1e-9:
+                bad = True
+                bits.append(f"only {rec_left:g} received and not yet invoiced")
+                for f in c.findings:
+                    if f["code"] == "NOT_RECEIVED":
+                        f["message"] += f" At line level: {li['quantity']:g} x '{line['description']}' billed, {rec_left:g} received and not yet invoiced ({line['receipts'] or 'no receipt'})."
+            else:
+                bits.append(f"received ({line['receipts']})")
         details.append(d(f"Line: {li['description']}", ", ".join(bits), "fail" if bad else "ok"))
 
     # Tax sanity against the rate the buyer expects.
@@ -580,7 +643,7 @@ def stage_amounts(c: Ctx):
             details.append(d("Tax", f"{money(tax, cur)}, consistent with {po['tax_rate']:g}% on the PO", "ok"))
 
     status = c.worst("amounts")
-    return status, {OK: "Amounts are within the PO balance and tolerance", WARN: "Amounts do not fit the PO"}.get(status, "Amount problems"), details
+    return status, {OK: "Within the PO balance, and everything billed has been received", WARN: "Invoice does not fit the PO or the goods received"}.get(status, "Amount problems"), details
 
 
 # --- Stage 8: decide -------------------------------------------------------------
@@ -598,7 +661,7 @@ def stage_decide(c: Ctx):
     else:
         decision, lead = "APPROVED", None
 
-    result = {"decision": decision, "reasons": rejects + holds, "notes": notes, "messages": []}
+    result = {"decision": decision, "reasons": rejects + holds, "notes": notes, "messages": [], "corrections": c.corrections}
     vendor_name = (c.vendor or {}).get("name") or inv.get("vendor_name") or "the vendor"
     inv_label = inv.get("invoice_number") or "(no invoice number)"
 
@@ -612,6 +675,7 @@ def stage_decide(c: Ctx):
             "No duplicate: file, invoice number and vendor/amount/date all checked against history.",
             f"{po['po_number']} was {'stated on the invoice' if c.po_match == 'stated' else 'inferred by the process'}; "
             f"{money(c.net, cur)} before tax fits the {money(po['remaining'], cur)} remaining.",
+            "3-way match: everything billed has been received and not invoiced before.",
         ]
         result.update(passed=passed, next_action=f"Schedule payment of {money(pay, cur)}" + (f" by the due date {inv['due_date']}." if inv.get("due_date") else " on standard terms."),
                       po_impact=f"{po['po_number']}: {money(po['remaining'], cur)} remaining before, {money(c.po_after or 0, cur)} after" + (" (PO closed)." if not c.po_after else " (PO stays open)."))
@@ -654,9 +718,13 @@ def stage_decide(c: Ctx):
 
 
 # --- Runner ----------------------------------------------------------------------
-def run_pipeline(run_id, data, filename, mime):
-    c = Ctx(run_id, data, filename, mime)
+def run_pipeline(run_id, data, filename, mime, override=None, corrections=None):
     started = time.perf_counter()
+    c = Ctx(run_id, data, filename, mime, override, corrections)
+    pool = ThreadPoolExecutor(max_workers=1)
+    if override is None:
+        # Start the slow step (the AI read) immediately, so it overlaps with intake.
+        c.future = pool.submit(extract, c.data, c.mime, c.text)
     fns = {"intake": stage_intake, "extract": stage_extract, "validate": stage_validate, "vendor": stage_vendor,
            "duplicate": stage_duplicate, "po_match": stage_po_match, "amounts": stage_amounts, "decide": stage_decide}
     for seq, (key, title) in enumerate(STAGES, 1):
@@ -673,6 +741,8 @@ def run_pipeline(run_id, data, filename, mime):
             t0 = time.perf_counter()
             status, summary, details = fns[key](c)
             ms = int((time.perf_counter() - t0) * 1000)
+            if key == "extract" and c.meta.get("ms") is not None:
+                ms = c.meta["ms"]   # true read time, including the part that overlapped intake
             pause = config.STAGE_PACING_MS / 1000 - (time.perf_counter() - t0)
             if pause > 0:
                 time.sleep(pause)
@@ -686,6 +756,8 @@ def run_pipeline(run_id, data, filename, mime):
                       result={"decision": "HOLD", "reasons": [{"title": "Process error", "message": f"{type(e).__name__}: {e}", "severity": HOLD, "owner": "AP analyst"}], "notes": [], "messages": [],
                               "next_action": "The process failed on this document. Handle it manually and report the error."},
                       duration_ms=int((time.perf_counter() - started) * 1000))
+    finally:
+        pool.shutdown(wait=False)
 
 
 def review(run_id, action, reviewer, note):
@@ -699,3 +771,31 @@ def review(run_id, action, reviewer, note):
         "at": datetime.now().isoformat(timespec="seconds"),
     })
     return db.get_run(run_id)
+
+
+EDITABLE = {"vendor_name": "vendor name", "invoice_number": "invoice number", "invoice_date": "invoice date", "po_number": "PO number",
+            "subtotal": "subtotal", "tax_amount": "tax", "total": "total"}
+
+
+def rerun(run_id, fields, reviewer, note):
+    """A person corrects what was read (or keys in what was missing) and the rules decide again.
+
+    The AI read is not repeated. The correction, who made it and why are kept on the run.
+    Returns the run id, or a string explaining why nothing was done.
+    """
+    run, f = db.get_run(run_id, with_stages=False), db.run_file(run_id)
+    if not run or not f:
+        return "Run not found"
+    if run["status"] == "running" or run["review"] or run["final_state"] not in ("HOLD", "REJECTED"):
+        return "Only invoices that are on hold or rejected, and not yet reviewed, can be corrected"
+    base = normalise(run["extraction"] or {})
+    proposed = normalise({**base, **{k: v for k, v in fields.items() if k in EDITABLE}, "is_invoice": True})
+    changes = [{"field": EDITABLE[k], "from": base[k], "to": proposed[k]} for k in EDITABLE if base[k] != proposed[k]]
+    if not changes:
+        return "Nothing was changed"
+    corrections = (run["corrections"] or []) + [{"by": reviewer, "note": note, "at": datetime.now().isoformat(timespec="seconds"), "changes": changes}]
+    db.clear_stages(run_id)
+    db.update_run(run_id, status="running", decision=None, final_state=None, headline=None, owner=None, findings=None, result=None, corrections=corrections)
+    data = Path(f["file_path"]).read_bytes()
+    threading.Thread(target=run_pipeline, args=(run_id, data, run["filename"], run["mime"], proposed, corrections), daemon=True).start()
+    return None

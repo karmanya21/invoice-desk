@@ -7,7 +7,7 @@ const api = async (path, opts) => {
   return r.json();
 };
 const OUTCOME = { APPROVED: "Approved", HOLD: "On hold", REJECTED: "Rejected" };
-const STAGE_NAMES = ["Receive document", "Read invoice", "Validate fields and arithmetic", "Verify vendor", "Check for duplicates", "Match purchase order", "Check amounts against PO balance", "Decide and route"];
+const STAGE_NAMES = ["Receive document", "Read invoice", "Validate fields and arithmetic", "Verify vendor", "Check for duplicates", "Match purchase order", "3-way match: PO balance and goods received", "Decide and route"];
 const ICON = { ok: "✓", warn: "!", fail: "✕", skipped: "–", pending: "", running: "" };
 
 const state = { view: "process", filter: "all", runs: [], liveSource: null, toggled: {}, timer: null };
@@ -36,7 +36,7 @@ $("#tabs").addEventListener("click", (e) => {
 /* ---------- run rendering (shared by live view and drawer) ---------- */
 function outcomeChip(run) {
   if (run.status === "running") return `<span class="chip running">Running</span>`;
-  const reviewed = run.review ? ` after review` : "";
+  const reviewed = run.review ? ` after review` : run.corrections?.length ? ` after correction` : "";
   return `<span class="chip ${run.final_state}">${OUTCOME[run.final_state] || run.final_state}${reviewed}</span>`;
 }
 
@@ -69,6 +69,17 @@ function decisionCard(run) {
       <div style="font-weight:600;margin-top:6px">${esc(m.subject)}</div><pre>${esc(m.body)}</pre></div>`;
   }
 
+  for (const c of run.corrections || []) {
+    h += `<div class="reviewed"><b>Fields corrected by ${esc(c.by)}</b> on ${esc(c.at.replace("T", " at "))}: ${c.changes.map((x) => `${esc(x.field)} ${esc(x.from ?? "nothing")} → ${esc(x.to ?? "nothing")}`).join(", ")}. “${esc(c.note)}”<br><span class="muted">The rules were run again on the corrected fields. The original read is kept in this record.</span></div>`;
+  }
+  if (!run.review && (run.final_state === "HOLD" || run.final_state === "REJECTED")) {
+    const x = run.extraction || {};
+    const f = (k, label, type = "text") => `<label>${label}<input data-fix="${k}" type="${type}" ${type === "number" ? 'step="0.01"' : ""} value="${esc(x[k] ?? "")}"></label>`;
+    h += `<details class="fix"><summary>Something read wrongly or missing? Correct the fields and re-check</summary>
+      <div class="fix-grid">${f("vendor_name", "Vendor name")}${f("invoice_number", "Invoice number")}${f("invoice_date", "Invoice date (YYYY-MM-DD)")}${f("po_number", "PO number")}${f("subtotal", "Subtotal", "number")}${f("tax_amount", "Tax", "number")}${f("total", "Total", "number")}</div>
+      <div class="review-row"><input data-fix-name placeholder="Your name" maxlength="60"><input data-fix-note placeholder="Why you are changing it (kept for audit)" maxlength="300" style="flex:2"></div>
+      <div class="review-row"><button class="btn" data-rerun="${run.id}">Re-check with these fields</button><span class="muted" style="align-self:center;font-size:13px">The document is not re-read. The same rules decide again.</span></div></details>`;
+  }
   if (run.review) {
     const r = run.review;
     h += `<div class="reviewed"><b>${r.action === "approve" ? "Approved" : "Rejected"} by ${esc(r.reviewer)}</b> on ${esc(r.at.replace("T", " at "))}${r.note ? `: “${esc(r.note)}”` : ""}<br><span class="muted">The process had put this on hold. A person made the final call, and both are kept for audit.</span></div>`;
@@ -83,8 +94,9 @@ function decisionCard(run) {
 function timeline(run) {
   const toggled = (state.toggled[run.id] ||= {});
   const stages = run.stages?.length ? run.stages : STAGE_NAMES.map((t, i) => ({ seq: i + 1, title: t, status: "pending", details: [] }));
+  const lastDone = Math.max(0, ...stages.filter((s) => !["pending", "running", "skipped"].includes(s.status)).map((s) => s.seq));
   return `<ol class="timeline">${stages.map((s) => {
-    const auto = s.status === "warn" || s.status === "fail" || (run.status === "running" && s.status !== "pending");
+    const auto = run.status === "running" ? s.seq === lastDone : s.status === "warn" || s.status === "fail";
     const open = s.details.length && (toggled[s.key] ?? auto);
     const summary = s.status === "running" ? "Working…" : s.summary || "";
     return `<li class="stage ${s.status}">
@@ -139,12 +151,18 @@ async function startRun(body) {
   }
   show("process");
   state.liveRun = id;
+  follow(id, live, () => setBusy(false));
+}
+
+// Stream a run's progress into el until it finishes.
+function follow(id, el, onDone = () => {}) {
+  if (state.liveSource) state.liveSource.close();
   const src = new EventSource(`/api/runs/${id}/events`);
   state.liveSource = src;
-  const finish = () => { src.close(); setBusy(false); refreshBadge(); };
+  const finish = () => { src.close(); onDone(); refreshBadge(); if (state.view === "dashboard") loadDashboard(); };
   src.onmessage = (ev) => {
     const run = JSON.parse(ev.data);
-    renderRun(run, live);
+    renderRun(run, el);
     if (run.status !== "running") finish();
   };
   src.onerror = async () => {
@@ -152,7 +170,7 @@ async function startRun(body) {
     src.close();
     for (let i = 0; i < 60; i++) {
       const run = await api(`/api/runs/${id}`).catch(() => null);
-      if (run) renderRun(run, live);
+      if (run) renderRun(run, el);
       if (run && run.status !== "running") break;
       await new Promise((r) => setTimeout(r, 500));
     }
@@ -207,6 +225,19 @@ document.addEventListener("click", async (e) => {
     await navigator.clipboard.writeText(copy.dataset.copy).catch(() => {});
     return toast("Copied to clipboard");
   }
+  const rr = t.closest("[data-rerun]");
+  if (rr) {
+    const box = rr.closest(".fix"), el = rr.closest("#drawer-body") || $("#run-live");
+    const reviewer = $("[data-fix-name]", box).value.trim(), note = $("[data-fix-note]", box).value.trim();
+    if (!reviewer || !note) return toast("Add your name and why you are changing it, both are kept for audit");
+    const fields = {};
+    box.querySelectorAll("[data-fix]").forEach((i) => (fields[i.dataset.fix] = i.value.trim() === "" ? null : i.value.trim()));
+    try {
+      await api(`/api/runs/${rr.dataset.rerun}/rerun`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ fields, reviewer, note }) });
+      follow(rr.dataset.rerun, el);
+    } catch (err) { toast(err.message); }
+    return;
+  }
   const rv = t.closest("[data-review]");
   if (rv) {
     const box = rv.closest(".review");
@@ -238,6 +269,13 @@ async function loadDashboard() {
     ["Cleared for payment", money(stats.cleared_value), "including invoices approved after review"],
     ["Stopped before payment", money(stats.stopped_value), `${stats.held} held and ${stats.rejected} rejected by the process`],
   ].map(([l, v, s, attn]) => `<div class="kpi ${attn ? "attn" : ""}"><div class="kpi-label">${l}</div><div class="kpi-value">${v}</div><div class="kpi-sub">${s}</div></div>`).join("");
+  const mins = stats.minutes_saved, hrs = mins >= 60 ? (mins / 60).toFixed(1) + " hours" : mins + " minutes";
+  $("#impact").innerHTML = !stats.processed ? `<div class="muted">Process an invoice to see the impact.</div>` : `
+    <div class="impact-line"><b>${hrs}</b> of manual work avoided on ${stats.processed} invoice${stats.processed === 1 ? "" : "s"}
+      <span class="muted">· assumes ${stats.impact.manual_minutes_per_invoice} min to handle an invoice by hand and ${stats.impact.review_minutes_per_hold} min for a person to decide a prepared hold</span></div>
+    ${stats.reasons.length ? `<table><thead><tr><th>Why invoices were stopped</th><th>Outcome</th><th>Goes to</th><th class="num">Invoices</th><th class="num">Value protected</th></tr></thead><tbody>
+      ${stats.reasons.map((g) => `<tr><td>${esc(g.reason)}</td><td><span class="chip ${g.outcome}">${OUTCOME[g.outcome]}</span></td><td>${esc(g.owner || "")}</td><td class="num">${g.count}</td><td class="num">${money(g.value)}</td></tr>`).join("")}
+    </tbody></table>` : `<div class="muted">Nothing has been stopped yet.</div>`}`;
   $("#filters").innerHTML = FILTERS.map(([k, l]) => `<button data-filter="${k}" class="${state.filter === k ? "active" : ""}">${l}</button>`).join("");
   renderRows();
   setBadge(stats.awaiting_review);
@@ -297,7 +335,7 @@ async function loadReference() {
     const pct = Math.min(100, Math.round((p.invoiced / p.amount) * 100));
     return `<tr><td><b style="font-weight:600">${p.po_number}</b></td><td>${esc(vname[p.vendor_id])}</td>
       <td>${esc(p.description)}<div class="muted" style="font-size:12px">${p.lines.map((l) => `${l.qty} × ${esc(l.description)} @ ${money(l.unit_price)}`).join(" · ")}</div></td>
-      <td>${esc(p.buyer)}</td><td class="num">${money(p.amount)}</td><td class="num">${money(p.invoiced)}</td><td class="num">${money(p.remaining)}</td>
+      <td>${esc(p.buyer)}</td><td class="num">${money(p.amount)}</td><td class="num">${money(p.received_value)}</td><td class="num">${money(p.invoiced)}</td><td class="num">${money(p.remaining)}</td>
       <td><div class="bar"><i class="${p.remaining < 0 ? "over" : ""}" style="width:${pct}%"></i></div></td>
       <td><span class="chip ${p.state === "closed" ? "" : p.state === "open" ? "ok" : "warn"}">${p.state}</span></td></tr>`;
   }).join("");
@@ -307,6 +345,8 @@ async function loadReference() {
   $("#rules").innerHTML = [
     `<b>Amount tolerance.</b> An invoice may exceed what is left on its PO by up to ${r.tolerance_pct}% of the PO or ${money(r.tolerance_abs)}, whichever is lower. Beyond that it goes to the buyer.`,
     `<b>Unit price.</b> A line price more than ${r.unit_price_tolerance_pct}% away from the PO price is held.`,
+    `<b>3-way match.</b> An invoice is only paid for goods and services that have been received and not invoiced before. Billing ahead of receipts is held for the buyer.`,
+    `<b>Scanned invoices.</b> Two models read every scan independently. If they disagree on anything that affects payment, it is held for a person to correct.`,
     `<b>Split POs.</b> Invoices are compared with the balance <i>remaining</i> on the PO, not its original value, so part-invoices work and over-billing across several invoices is caught.`,
     `<b>Duplicates.</b> Same file or same invoice number from a vendor is rejected. Same vendor and total within ${r.near_duplicate_window_days} days under a different number is held as a probable duplicate.`,
     `<b>Vendor identity.</b> The name must match the vendor master (${Math.round(r.vendor_fuzzy_threshold * 100)}% similarity at minimum), and any tax ID or bank account mismatch stops payment.`,

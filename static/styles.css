@@ -182,3 +182,14 @@ table.runs tbody tr:hover { background: var(--soft); }
   .detail { grid-template-columns: 1fr; gap: 0; }
   main { padding: 14px 12px 40px; }
 }
+
+/* correct-and-recheck form, impact panel */
+.fix { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; margin-top: 12px; }
+.fix summary { cursor: pointer; font-weight: 600; }
+.fix-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; margin-top: 12px; }
+.fix label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+.fix input { padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; font: inherit; color: var(--ink); min-width: 0; }
+.fix .review-row input { flex: 1; min-width: 140px; }
+.impact-line { font-size: 15px; margin: 6px 0 12px; }
+.impact-line b { font-size: 20px; font-weight: 650; }
+.impact-line .muted { font-size: 13px; }

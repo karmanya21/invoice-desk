@@ -5,7 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 
 from . import config
-from .seed_data import PURCHASE_ORDERS, VENDORS
+from .seed_data import GOODS_RECEIPTS, PURCHASE_ORDERS, VENDORS
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS vendors (
@@ -19,13 +19,16 @@ CREATE TABLE IF NOT EXISTS purchase_orders (
 CREATE TABLE IF NOT EXISTS po_lines (
     po_number TEXT, line_no INTEGER, description TEXT, qty REAL, unit_price REAL
 );
+CREATE TABLE IF NOT EXISTS goods_receipts (
+    po_number TEXT, line_no INTEGER, qty REAL, received_date TEXT, receipt_no TEXT
+);
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY, created_at TEXT, filename TEXT, file_hash TEXT, file_path TEXT, mime TEXT,
     status TEXT,            -- running | done | error
     decision TEXT,          -- what the process decided: APPROVED | HOLD | REJECTED
     final_state TEXT,       -- decision after any human review
     headline TEXT, owner TEXT, extractor TEXT,
-    extraction TEXT, findings TEXT, result TEXT, review TEXT,
+    extraction TEXT, findings TEXT, result TEXT, review TEXT, corrections TEXT,
     vendor_id TEXT, vendor_name TEXT, invoice_number TEXT, invoice_number_norm TEXT,
     invoice_date TEXT, po_number TEXT, currency TEXT,
     net_amount REAL, tax_amount REAL, total_amount REAL, duration_ms INTEGER
@@ -37,7 +40,7 @@ CREATE TABLE IF NOT EXISTS stages (
 );
 """
 
-JSON_RUN_FIELDS = ("extraction", "findings", "result", "review")
+JSON_RUN_FIELDS = ("extraction", "findings", "result", "review", "corrections")
 
 
 @contextmanager
@@ -75,12 +78,13 @@ def _seed(c):
         )
         for i, (desc, qty, price) in enumerate(po["lines"], 1):
             c.execute("INSERT INTO po_lines VALUES (?,?,?,?,?)", (po["po_number"], i, desc, qty, price))
+    c.executemany("INSERT INTO goods_receipts VALUES (?,?,?,?,?)", GOODS_RECEIPTS)
 
 
 def reset():
     """Wipe all runs and restore the reference data to its starting state."""
     with connect() as c:
-        for t in ("stages", "runs", "po_lines", "purchase_orders", "vendors"):
+        for t in ("stages", "runs", "goods_receipts", "po_lines", "purchase_orders", "vendors"):
             c.execute(f"DELETE FROM {t}")
         _seed(c)
     if config.UPLOAD_DIR.exists():
@@ -100,6 +104,11 @@ def vendors():
 def _po_dict(c, row, exclude_run=None):
     po = dict(row)
     po["lines"] = [dict(r) for r in c.execute("SELECT * FROM po_lines WHERE po_number=? ORDER BY line_no", (po["po_number"],))]
+    for line in po["lines"]:
+        rec = c.execute("SELECT COALESCE(SUM(qty),0), GROUP_CONCAT(DISTINCT receipt_no) FROM goods_receipts WHERE po_number=? AND line_no=?",
+                        (po["po_number"], line["line_no"])).fetchone()
+        line["received"], line["receipts"] = rec[0], rec[1] or ""
+    po["received_value"] = round(sum(l["received"] * l["unit_price"] for l in po["lines"]), 2)
     q = "SELECT id, invoice_number, net_amount FROM runs WHERE po_number=? AND final_state='APPROVED'"
     args = [po["po_number"]]
     if exclude_run:
@@ -194,6 +203,11 @@ def runs_with_hash(file_hash, exclude_run):
             (file_hash, exclude_run),
         ).fetchall()
     return [_run_dict(r) for r in rows]
+
+
+def clear_stages(run_id):
+    with connect() as c:
+        c.execute("DELETE FROM stages WHERE run_id=?", (run_id,))
 
 
 def upsert_stage(run_id, seq, key, title, status, summary="", details=None, duration_ms=None):

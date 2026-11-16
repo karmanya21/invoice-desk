@@ -24,6 +24,8 @@ GEMINI_MODELS = [
     if m.strip()
 ]
 GEMINI_TIMEOUT_S = float(os.getenv("GEMINI_TIMEOUT_S", "8"))
+# How long a scan waits for its second, confirming read after the first one arrives.
+SECOND_READ_GRACE_S = float(os.getenv("SECOND_READ_GRACE_S", "3"))
 
 # --- Business rules ----------------------------------------------------------
 RULES = {
@@ -49,4 +51,10 @@ RULES = {
 
 # Minimum time a stage stays on screen in the live view. The real compute time
 # is recorded separately and shown per stage; this only paces the display.
-STAGE_PACING_MS = int(os.getenv("STAGE_PACING_MS", "450"))
+STAGE_PACING_MS = int(os.getenv("STAGE_PACING_MS", "150"))
+
+# Assumptions behind the "manual work avoided" figure on the dashboard.
+IMPACT = {
+    "manual_minutes_per_invoice": 8,   # open PDF, find PO in spreadsheet, check, key in
+    "review_minutes_per_hold": 3,      # a person reading a prepared hold and deciding
+}
