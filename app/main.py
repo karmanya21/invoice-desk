@@ -3,7 +3,7 @@ import asyncio
 import json
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -73,7 +73,7 @@ async def start_run(file: UploadFile | None = File(None), sample: str | None = F
     stored = config.UPLOAD_DIR / f"{run_id}{Path(filename).suffix.lower()}"
     config.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     stored.write_bytes(data)
-    db.create_run({"id": run_id, "created_at": datetime.now().isoformat(timespec="seconds"), "filename": filename,
+    db.create_run({"id": run_id, "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "filename": filename,
                    "file_path": str(stored), "mime": mime, "status": "running"})
     threading.Thread(target=pipeline.run_pipeline, args=(run_id, data, filename, mime), daemon=True).start()
     return {"id": run_id}

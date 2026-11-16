@@ -6,6 +6,8 @@ const api = async (path, opts) => {
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `Request failed (${r.status})`);
   return r.json();
 };
+// Times are stored in UTC and shown in the viewer's own timezone.
+const when = (s) => new Date(s).toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 const OUTCOME = { APPROVED: "Approved", HOLD: "On hold", REJECTED: "Rejected" };
 const STAGE_NAMES = ["Receive document", "Read invoice", "Validate fields and arithmetic", "Verify vendor", "Check for duplicates", "Match purchase order", "3-way match: PO balance and goods received", "Decide and route"];
 const ICON = { ok: "✓", warn: "!", fail: "✕", skipped: "–", pending: "", running: "" };
@@ -70,7 +72,7 @@ function decisionCard(run) {
   }
 
   for (const c of run.corrections || []) {
-    h += `<div class="reviewed"><b>Fields corrected by ${esc(c.by)}</b> on ${esc(c.at.replace("T", " at "))}: ${c.changes.map((x) => `${esc(x.field)} ${esc(x.from ?? "nothing")} → ${esc(x.to ?? "nothing")}`).join(", ")}. “${esc(c.note)}”<br><span class="muted">The rules were run again on the corrected fields. The original read is kept in this record.</span></div>`;
+    h += `<div class="reviewed"><b>Fields corrected by ${esc(c.by)}</b> on ${when(c.at)}: ${c.changes.map((x) => `${esc(x.field)} ${esc(x.from ?? "nothing")} → ${esc(x.to ?? "nothing")}`).join(", ")}. “${esc(c.note)}”<br><span class="muted">The rules were run again on the corrected fields. The original read is kept in this record.</span></div>`;
   }
   if (!run.review && (run.final_state === "HOLD" || run.final_state === "REJECTED")) {
     const x = run.extraction || {};
@@ -82,7 +84,7 @@ function decisionCard(run) {
   }
   if (run.review) {
     const r = run.review;
-    h += `<div class="reviewed"><b>${r.action === "approve" ? "Approved" : "Rejected"} by ${esc(r.reviewer)}</b> on ${esc(r.at.replace("T", " at "))}${r.note ? `: “${esc(r.note)}”` : ""}<br><span class="muted">The process had put this on hold. A person made the final call, and both are kept for audit.</span></div>`;
+    h += `<div class="reviewed"><b>${r.action === "approve" ? "Approved" : "Rejected"} by ${esc(r.reviewer)}</b> on ${when(r.at)}${r.note ? `: “${esc(r.note)}”` : ""}<br><span class="muted">The process had put this on hold. A person made the final call, and both are kept for audit.</span></div>`;
   } else if (run.final_state === "HOLD") {
     h += `<div class="review"><b>Your decision</b> <span class="muted">· nothing is paid until someone decides</span>
       <div class="review-row"><input id="rv-name" placeholder="Your name" maxlength="60"><input id="rv-note" placeholder="Reason (kept for audit)" maxlength="300" style="flex:2"></div>
@@ -125,7 +127,7 @@ function renderRun(run, el) {
   const secs = run.duration_ms != null ? ` · ${(run.duration_ms / 1000).toFixed(1)} s end to end` : "";
   const reader = run.extractor ? ` · read by ${run.extractor === "gemini" ? "Gemini" : "offline parser"}` : "";
   $(".run-head", shell).innerHTML = `<div><div class="run-title">${esc(run.filename)}</div>
-    <div class="run-meta">Run ${run.id} · received ${esc(run.created_at.replace("T", " "))}${secs}${reader}</div></div>${outcomeChip(run)}`;
+    <div class="run-meta">Run ${run.id} · received ${when(run.created_at)}${secs}${reader}</div></div>${outcomeChip(run)}`;
   const focus = document.activeElement?.id;
   const vals = { name: $("#rv-name", shell)?.value, note: $("#rv-note", shell)?.value };
   $(".run-main", shell).innerHTML = (run.status !== "running" ? decisionCard(run) : "") + `<h3 style="margin-top:0">What the process did</h3>` + timeline(run);
@@ -293,7 +295,7 @@ function renderRows() {
   $("#runs-empty").hidden = rows.length > 0;
   $("#runs-empty").textContent = state.runs.length ? "No invoices match this filter." : "No invoices yet. Process one to see it here.";
   $("#runs-body").innerHTML = rows.map((r) => `<tr data-run="${r.id}">
-      <td class="muted" style="white-space:nowrap">${esc(r.created_at.slice(5, 16).replace("T", " "))}</td>
+      <td class="muted" style="white-space:nowrap">${when(r.created_at)}</td>
       <td><b style="font-weight:600">${esc(r.vendor_name || "Unknown")}</b><div class="muted" style="font-size:12px">${esc(r.filename)}</div></td>
       <td>${esc(r.invoice_number || "—")}</td><td>${esc(r.po_number || "—")}</td>
       <td class="num">${money(r.total_amount, r.currency)}</td>

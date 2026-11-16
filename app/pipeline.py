@@ -19,7 +19,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from difflib import SequenceMatcher
 
@@ -768,7 +768,7 @@ def review(run_id, action, reviewer, note):
     final = "APPROVED" if action == "approve" else "REJECTED"
     db.update_run(run_id, final_state=final, review={
         "action": action, "reviewer": reviewer or "Reviewer", "note": note or "",
-        "at": datetime.now().isoformat(timespec="seconds"),
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     })
     return db.get_run(run_id)
 
@@ -793,7 +793,7 @@ def rerun(run_id, fields, reviewer, note):
     changes = [{"field": EDITABLE[k], "from": base[k], "to": proposed[k]} for k in EDITABLE if base[k] != proposed[k]]
     if not changes:
         return "Nothing was changed"
-    corrections = (run["corrections"] or []) + [{"by": reviewer, "note": note, "at": datetime.now().isoformat(timespec="seconds"), "changes": changes}]
+    corrections = (run["corrections"] or []) + [{"by": reviewer, "note": note, "at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "changes": changes}]
     db.clear_stages(run_id)
     db.update_run(run_id, status="running", decision=None, final_state=None, headline=None, owner=None, findings=None, result=None, corrections=corrections)
     data = Path(f["file_path"]).read_bytes()
