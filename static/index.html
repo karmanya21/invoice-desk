@@ -9,7 +9,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
-  <link rel="stylesheet" href="styles.css?v=3">
+  <link rel="stylesheet" href="styles.css?v=4">
 </head>
 <body>
   <header class="topbar">
@@ -101,9 +101,12 @@
           <div id="rule-inputs" class="rule-inputs"></div>
           <h3>What the process has learned, and rule changes</h3>
           <ul class="rules" id="learned"></ul>
-          <h3>The rules in plain words</h3>
-          <ul class="rules" id="rules"></ul>
         </div>
+      </div>
+      <div class="panel">
+        <h2>The rules in plain words</h2>
+        <p class="hint">Every decision the process makes comes from one of these. The numbers follow the thresholds above.</p>
+        <ul class="rules cols" id="rules"></ul>
       </div>
     </section>
   </main>
@@ -115,6 +118,6 @@
   </aside>
   <div class="toast" id="toast" hidden></div>
 
-  <script src="app.js?v=3"></script>
+  <script src="app.js?v=4"></script>
 </body>
 </html>
