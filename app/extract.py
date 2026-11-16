@@ -111,6 +111,7 @@ def normalise(raw: dict) -> dict:
 
 # --- Extractor 1: Gemini -------------------------------------------------------
 _preferred = []  # the model that answered last time is tried first next time
+_blocked = {}    # model -> time until which it is skipped (quota exhausted)
 
 
 def _call(client, model, data, mime, thinking_off):
@@ -140,7 +141,7 @@ def _read(model, data, mime) -> dict:
         raise ExtractionError(f"{model}: no answer within {config.GEMINI_TIMEOUT_S:g} s ({type(e).__name__})")
     if r.status_code != 200:
         try:
-            msg = r.json().get("error", {}).get("message", "")[:160]
+            msg = " ".join(r.json().get("error", {}).get("message", "").split())[:400]
         except Exception:
             msg = r.text[:160]
         raise ExtractionError(f"{model}: HTTP {r.status_code} {msg}")
@@ -154,24 +155,31 @@ def _read(model, data, mime) -> dict:
 
 
 def gemini_extract(data: bytes, mime: str, want_second: bool = False):
-    """Ask two models at the same time.
+    """Read the document with Gemini.
 
-    - Digital PDF: take whichever answers first (one slow or overloaded model no
-      longer stalls the run). The answer is cross-checked against the PDF text later.
-    - Scan (want_second): wait for both, so the two independent reads can be compared.
+    - Digital PDF: one request. If that model is slow, busy or over quota, the next
+      one is tried. The answer is cross-checked against the PDF text later.
+    - Scan (want_second): two models read it at the same time, so the two
+      independent reads can be compared.
+
+    One request per invoice matters: the free tier allows only a few requests per
+    model per day, so racing models for speed would burn the quota twice as fast.
+    A model that reports its quota is used up is skipped until it resets.
 
     Returns (fields, model, second_fields_or_None, second_model_or_None).
     """
-    models = _preferred + [m for m in config.GEMINI_MODELS if m not in _preferred]
+    now = time.time()
+    models = [m for m in _preferred + [m for m in config.GEMINI_MODELS if m not in _preferred] if _blocked.get(m, 0) < now]
     if not models:
-        raise ExtractionError("no model configured")
+        raise ExtractionError("every configured model is over its free-tier quota for now")
+    width = 2 if want_second else 1
     errors, good, deadline = [], [], None   # good: [(model, fields)] in order of arrival
     pool = ThreadPoolExecutor(max_workers=2)
     try:
         queue = list(models)
         running = {}
         while (queue or running) and len(good) < (2 if want_second else 1):
-            while queue and len(running) < 2:
+            while queue and len(running) < width:
                 m = queue.pop(0)
                 running[pool.submit(_read, m, data, mime)] = m
             # Once one read is in, the second opinion gets a short grace period, not the full timeout.
@@ -186,6 +194,8 @@ def gemini_extract(data: bytes, mime: str, want_second: bool = False):
                     deadline = deadline or time.perf_counter() + config.SECOND_READ_GRACE_S
                 except ExtractionError as e:
                     errors.append(str(e))
+                    if "HTTP 429" in str(e):   # daily quota: skip for an hour; per-minute: for a minute
+                        _blocked[m] = time.time() + (3600 if "per day" in str(e) else 60)
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     if not good:

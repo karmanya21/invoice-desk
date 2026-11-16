@@ -19,11 +19,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODELS = [
     m.strip()
     for m in os.getenv(
-        "GEMINI_MODELS", "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.8-flash"
+        "GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.8-flash"
     ).split(",")
     if m.strip()
 ]
-GEMINI_TIMEOUT_S = float(os.getenv("GEMINI_TIMEOUT_S", "8"))
+GEMINI_TIMEOUT_S = float(os.getenv("GEMINI_TIMEOUT_S", "6"))
 # How long a scan waits for its second, confirming read after the first one arrives.
 SECOND_READ_GRACE_S = float(os.getenv("SECOND_READ_GRACE_S", "3"))
 
