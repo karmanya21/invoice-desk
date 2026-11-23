@@ -4,6 +4,8 @@ Takes a vendor invoice (PDF or image) and produces a reasoned decision:
 **Approved**, **On hold** (a specific question to a named owner, with a recommended answer), or **Rejected** (with a drafted reply to the vendor).
 Every stage is visible live, and every run is kept in a dashboard.
 
+**Live demo:** https://invoice-desk-wcz2.onrender.com (free tier: if nobody has used it for a while, the first visit takes up to a minute to wake it).
+
 ## Run it
 
 ```bash
